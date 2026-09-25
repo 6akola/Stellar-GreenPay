@@ -20,12 +20,15 @@ const PROJECT = {
 };
 
 async function mockProject(page: Page) {
-  await page.route("**/api/**", (route) =>
-    route.fulfill({ json: { success: true, data: [] } }),
-  );
-  await page.route(new RegExp(`/api/(v1/)?projects/${PROJECT_ID}(\\?.*)?$`), (route) =>
-    route.fulfill({ json: { success: true, data: PROJECT } }),
-  );
+  await page.route("**/api/**", (route) => {
+    const url = new URL(route.request().url());
+    const projectPath = new RegExp(`^/api/(v1/)?projects/${PROJECT_ID}$`);
+    return route.fulfill({
+      json: projectPath.test(url.pathname)
+        ? { success: true, data: PROJECT }
+        : { success: true, data: [] },
+    });
+  });
 }
 
 test.describe("monthly giving setup", () => {
