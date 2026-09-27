@@ -44,15 +44,15 @@ export default function AnimatedNumber({
     return 0;
   })();
 
-  const [displayValue, setDisplayValue] = useState(duration <= 0 ? numericValue : 0);
+  const [displayValue, setDisplayValue] = useState(0);
   const startTimeRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (duration <= 0) {
-      setDisplayValue(numericValue);
       return;
     }
 
+    startTimeRef.current = null;
     let animationFrameId: number;
 
     const animate = (time: number) => {
@@ -77,7 +77,8 @@ export default function AnimatedNumber({
     return Math.floor(val).toLocaleString();
   };
 
-  const renderedContent = formatDisplay(displayValue);
+  const effectiveValue = duration <= 0 ? numericValue : displayValue;
+  const renderedContent = formatDisplay(effectiveValue);
 
   return (
     <>

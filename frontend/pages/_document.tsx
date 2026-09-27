@@ -34,7 +34,6 @@ class MyDocument extends Document<Props> {
     return (
       <Html lang="en">
         <Head nonce={nonce}>
-          <title>Stellar GreenPay</title>
           {/* The inline body script below is statically stringified — it
               reads `localStorage` directly rather than DOM meta tags, so
               no `<meta name="csp-nonce">` echo is needed here. The script
