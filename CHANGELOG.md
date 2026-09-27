@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added synchronous profile update fallback in `profileQueue` when queue worker is not started and added webhook secret rotation columns to `schema.sql`.
 - Awaited profile updates and milestone delivery in `donations.js` to eliminate race conditions, added polling in integration tests, and fixed postgres health check and CI integration skip configuration in `backend.yml`.
 
+### Fixed
+
+- Project cover photos that fail to load now fall back to a branded leaf placeholder (`/project-placeholder.svg`) instead of a broken-image icon, in both `ProjectCard` and the map popup (#1069).
+- The live donation feed detects a dropped Horizon SSE stream, shows a "Reconnecting…" banner, retries with exponential backoff, and merges anything that arrived while disconnected via a REST catch-up (#1071).
+- The selected language persists across sessions under `greenpay:locale` (migrated from the bare `locale` key), falls back to `navigator.language`, and sets `<html lang>` before first paint instead of re-rendering after hydration (#1073).
+
 
 ## [1.0.0] - 2025-01-01
 
