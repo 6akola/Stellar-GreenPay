@@ -22,12 +22,13 @@ const PROJECT = {
 async function mockProject(page: Page) {
   await page.route("**/api/**", (route) => {
     const url = new URL(route.request().url());
-    const projectPath = new RegExp(`^/api/(v1/)?projects/${PROJECT_ID}$`);
-    return route.fulfill({
-      json: projectPath.test(url.pathname)
-        ? { success: true, data: PROJECT }
-        : { success: true, data: [] },
-    });
+    if (url.pathname === `/api/v1/projects/${PROJECT_ID}` || url.pathname === `/api/projects/${PROJECT_ID}`) {
+      return route.fulfill({ json: { success: true, data: PROJECT } });
+    }
+    if (url.pathname === `/api/v1/subscriptions/${PROJECT_ID}/count` || url.pathname === `/api/subscriptions/${PROJECT_ID}/count`) {
+      return route.fulfill({ json: { success: true, count: 0 } });
+    }
+    return route.fulfill({ json: { success: true, data: [] } });
   });
 }
 
