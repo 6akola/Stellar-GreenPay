@@ -16,6 +16,7 @@ Stellar GreenPay is an open-source climate donation platform where donors give X
 - 🔗 **Wallet Connect** — Freighter browser wallet integration
 - 🌍 **Browse Projects** — Verified climate projects with impact metrics
 - 💚 **Donate XLM** — Direct on-chain donations to project wallets
+- 🌉 **Bridge USDC** — Move USDC from Ethereum/Polygon to Stellar via Circle CCTP, no custody ([docs](docs/bridge.md))
 - 📊 **Impact Tracking** — Soroban contract tracks every donation and CO₂ offset
 - 🏆 **Leaderboard** — Top donors ranked by total XLM given
 - 💬 **Project Updates** — Organisations post progress updates to donors
@@ -141,11 +142,21 @@ Please note that this project is governed by a [Code of Conduct](CODE_OF_CONDUCT
 
 Every push and every pull request to `main` runs Gitleaks with the repo-local `.gitleaks.toml` config. Any detected secret fails CI, so keep real credentials out of source control; use `.env` files locally and GitHub encrypted secrets for CI/deployment values. The allowlist only covers generated archives, env templates, and deterministic test fixtures.
 
+### GitHub Actions Secrets
+
+See [`docs/github-actions-secrets.md`](docs/github-actions-secrets.md) for a
+complete reference of all encrypted secrets required by the project's CI/CD
+pipelines, including:
+
+- Database backup credentials (AWS S3 / Google Cloud Storage)
+- Mobile EAS build tokens (Expo)
+- Database connection secrets
+- Quick setup guide and rotation policy
+
 ## 🗺 Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for planned features.
 
 ## 📄 License
 
-MIT — see [LICENSE](LICENSE) 
-fixed
+MIT — see [LICENSE](LICENSE)
