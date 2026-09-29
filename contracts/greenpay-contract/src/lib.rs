@@ -29,6 +29,16 @@ use soroban_sdk::{
     token, Address, Env, symbol_short, Symbol, String, BytesN, Vec,
 };
 
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    InvalidPageSize = 1,
+}
+
+
 // ─── Oracle interface ─────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -277,21 +287,9 @@ const MAX_VOTING_WINDOW_LEDGERS: u32 = 518_400; // 30 days @ 5s/ledger
 // panics and misleading impact figures from misconfigured projects.
 const MAX_CO2_PER_XLM: u32 = 100_000;
 
-fn is_valid_metadata_url(url: &String) -> bool {
-    const HTTPS_PREFIX: &[u8] = b"https://";
-    let bytes = url.to_bytes();
-    if url.len() > 500 || bytes.len() < HTTPS_PREFIX.len() as u32 {
-        return false;
-    }
+// Maximum page size for paginated queries to protect contract resource limits
+pub const MAX_PAGE_SIZE: u32 = 100;
 
-    for (index, expected) in HTTPS_PREFIX.iter().enumerate() {
-        if bytes.get(index as u32) != Some(*expected) {
-            return false;
-        }
-    }
-
-    true
-}
 
 fn calculate_badge(total_stroops: i128) -> BadgeTier {
     let xlm = total_stroops / STROOP;
@@ -1015,6 +1013,7 @@ impl GreenPayContract {
     /// A `Vec<Project>` containing up to `limit` projects starting from `offset`.
     /// If `offset` is greater than or equal to the total number of projects,
     /// returns an empty vector without panicking.
+    /// Returns `ContractError::InvalidPageSize` if `limit > MAX_PAGE_SIZE`.
     ///
     /// # Example
     /// ```ignore
@@ -1023,7 +1022,15 @@ impl GreenPayContract {
     /// // Get next 10 projects
     /// let projects = contract.get_all_projects_paginated(10, 10);
     /// ```
-    pub fn get_all_projects_paginated(env: Env, offset: u32, limit: u32) -> Vec<Project> {
+    pub fn get_all_projects_paginated(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Project>, ContractError> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(ContractError::InvalidPageSize);
+        }
+
         // Retrieve the list of project IDs, or empty vec if not yet initialized
         let project_ids: Vec<String> = env
             .storage()
@@ -1035,7 +1042,7 @@ impl GreenPayContract {
         
         // If offset is out of bounds, return empty vec
         if offset >= total_count {
-            return Vec::new(&env);
+            return Ok(Vec::new(&env));
         }
         
         // Calculate the end bound: min(offset + limit, total_count).
@@ -1064,8 +1071,9 @@ impl GreenPayContract {
             idx += 1;
         }
         
-        result
+        Ok(result)
     }
+
 
     pub fn get_admin(env: Env) -> Address {
         env.storage()
@@ -2214,6 +2222,30 @@ mod tests {
         let offset_beyond_end = client.get_donor_history(&donor, &u32::MAX, &u32::MAX);
         assert_eq!(offset_beyond_end.len(), 0);
     }
+
+    #[test]
+    fn test_get_all_projects_paginated_page_size_cap() {
+        let (_env, _cid, client, _admin, _pid) = setup();
+
+        // request 200 items -> error
+        let err_200 = client.try_get_all_projects_paginated(&0, &200);
+        assert_eq!(err_200, Err(Ok(ContractError::InvalidPageSize)));
+
+        // request 101 items -> error
+        let err_101 = client.try_get_all_projects_paginated(&0, &101);
+        assert_eq!(err_101, Err(Ok(ContractError::InvalidPageSize)));
+
+        // request 100 items -> success
+        let ok_100 = client.try_get_all_projects_paginated(&0, &100);
+        assert!(ok_100.is_ok());
+        let projects = ok_100.unwrap().unwrap();
+        assert!(!projects.is_empty());
+
+        // direct call with 100 items -> success
+        let direct_projects = client.get_all_projects_paginated(&0, &100);
+        assert!(!direct_projects.is_empty());
+    }
+
 
     #[test]
     fn test_get_global_stats_initial_zeros() {
