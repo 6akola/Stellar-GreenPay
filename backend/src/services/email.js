@@ -397,6 +397,7 @@ function buildStatusChangeText({ request, newStatus, adminUrl }) {
 }
 
 /**
+<<<<<<< HEAD
  * Notify a donor that their recurring donation was cancelled because the project was deactivated.
  *
  * @param {object} opts
@@ -471,6 +472,8 @@ async function sendRecurringDonationCancelledEmail({ email, projectName, donatio
 }
 
 /**
+=======
+>>>>>>> ibrahim/fix/1148-deactivate-project-cancel-recurring
  * Alert platform admins that a webhook delivery has been abandoned after all
  * retries were exhausted, so the dropped event can be investigated and the
  * project owner can be told to reconcile manually.
