@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Smart Contracts section in `CONTRIBUTING.md` covering Soroban test/build/WASM/deploy workflows and linking the deployment and integration docs (#1281).
 - CHANGELOG.md — project changelog tracking.
 - Per-donation CO₂ offset in donation API responses via `co2OffsetKg` field, computed as `amount_xlm × co2_per_xlm / 1000` across all donation endpoints (#365).
 - On-chain USDC to XLM price conversion through a configured oracle adapter (#345).
