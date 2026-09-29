@@ -110,6 +110,14 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
     }
   }, [streak.longest]);
 
+  // ── Certificate image download (issue #1200) ───────────────────────────────
+  // The first click rasterizes the certificate DOM once; later clicks reuse
+  // the cached PNG until the donor's badge tier changes (the cache key), so
+  // repeated downloads never re-render the subtree or compete on the main
+  // thread.
+  const [certificateRendering, setCertificateRendering] = useState(false);
+  const certificateCanvasUrlRef = useRef<{ key: string; dataUrl: string } | null>(null);
+
   if (!publicKey) return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-16">
       <div className="text-center mb-10">
@@ -180,13 +188,6 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
     );
   };
 
-  // ── Certificate image download (issue #1200) ───────────────────────────────
-  // The first click rasterizes the certificate DOM once; later clicks reuse
-  // the cached PNG until the donor's badge tier changes (the cache key), so
-  // repeated downloads never re-render the subtree or compete on the main
-  // thread.
-  const [certificateRendering, setCertificateRendering] = useState(false);
-  const certificateCanvasUrlRef = useRef<{ key: string; dataUrl: string } | null>(null);
   // Key includes the address (certificates are per donor) and the badge tier:
   // a tier change produces a new key, invalidating the cached snapshot.
   const certificateCacheKey = `${publicKey}|${topBadgeTier ?? "none"}`;
