@@ -75,18 +75,6 @@ async function isUrlSafeFromSsrf(urlString) {
   const cleanHostname = hostname.replace(/^\[|\]$/g, "");
   if (net.isIP(cleanHostname)) {
     return !isPrivateIp(cleanHostname);
-  // WHATWG URL serializes IPv6 hosts with brackets ("[2606:4700::1111]"),
-  // which neither net.isIP nor getaddrinfo reliably accepts. Strip them so IP
-  // literals take the short-circuit path below instead of being resolved by
-  // libc — the result otherwise depends on whether the platform tolerates
-  // brackets (glibc does, musl does not, so this passed locally and failed in
-  // the node:20-alpine test image).
-  if (hostname.startsWith("[") && hostname.endsWith("]")) {
-    hostname = hostname.slice(1, -1);
-  }
-
-  if (net.isIP(hostname)) {
-    return !isPrivateIp(hostname);
   }
 
   try {
