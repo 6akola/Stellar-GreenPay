@@ -764,6 +764,7 @@ impl GreenPayContract {
 
         // Auto-mint an Impact NFT when a donor reaches a new badge tier.
         if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+            env.events().publish((soroban_sdk::Symbol::new(&env, "BadgeUpgraded"), donor.clone()), donor_stats.badge.clone());
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -1822,6 +1823,7 @@ impl GreenPayContract {
             .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
 
         if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+            env.events().publish((soroban_sdk::Symbol::new(&env, "BadgeUpgraded"), donor.clone()), donor_stats.badge.clone());
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -2274,7 +2276,7 @@ mod tests {
 
         #[test]
     fn test_get_donation_record() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         // Set up USDC token and oracle
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -2294,7 +2296,7 @@ mod tests {
 
     #[test]
     fn test_usdc_donation_uses_configured_oracle_rate() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
         let oracle = env.register_contract(None, FractionalMockOracle);
@@ -2317,7 +2319,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "StalePriceData")]
     fn test_donate_usdc_rejects_stale_oracle_price() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
         let oracle = env.register_contract(None, TimestampedMockOracle);
@@ -2337,7 +2339,7 @@ mod tests {
 
     #[test]
     fn test_donate_usdc_accepts_fresh_oracle_price() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
         let oracle = env.register_contract(None, TimestampedMockOracle);
@@ -2358,7 +2360,7 @@ mod tests {
 
     #[test]
     fn test_set_max_price_age_is_admin_gated_and_persists() {
-        let (env, _cid, client, admin, _pid) = setup();
+        let (env, _cid, client, admin, _pid) = crate::tests::setup();
         assert_eq!(client.get_max_price_age(), DEFAULT_MAX_PRICE_AGE_SECS);
 
         client.set_max_price_age(&admin, &600u64);
@@ -2368,14 +2370,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only admin can set max price age")]
     fn test_set_max_price_age_rejects_non_admin() {
-        let (env, _cid, client, _admin, _pid) = setup();
+        let (env, _cid, client, _admin, _pid) = crate::tests::setup();
         let attacker = Address::generate(&env);
         client.set_max_price_age(&attacker, &600u64);
     }
 
     #[test]
     fn test_get_donor_history() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         env.mock_all_auths();
         let donor = Address::generate(&env);
         let wallet = Address::generate(&env);
@@ -2626,7 +2628,7 @@ mod tests {
     // ─── Governance helpers ───────────────────────────────────────────────────
 
     /// Set up a fresh contract with one registered project.
-    fn setup() -> (
+    pub fn setup() -> (
         Env,
         soroban_sdk::Address,
         GreenPayContractClient<'static>,
@@ -2678,7 +2680,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_preserves_donation_state_and_storage_keys() {
-        let (env, cid, client_v1, _admin, pid) = setup();
+        let (env, cid, client_v1, _admin, pid) = crate::tests::setup();
         let donor = Address::generate(&env);
         let token_admin = Address::generate(&env);
         let token = env
@@ -2777,7 +2779,7 @@ mod tests {
 
     #[test]
     fn test_create_proposal() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let p = client.get_proposal(&pid);
         assert_eq!(p.votes_for, 0);
@@ -2789,14 +2791,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Proposal already exists for this project")]
     fn test_create_duplicate_proposal_fails() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         client.create_proposal(&admin, &pid, &0u32);
     }
 
     #[test]
     fn test_cast_vote() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let voter = Address::generate(&env);
         grant_badge(&env, &cid, &voter);
@@ -2809,7 +2811,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only badge holders (Seedling or above) can vote")]
     fn test_non_badge_holder_cannot_vote() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let non_donor = Address::generate(&env);
         client.vote_verify_project(&non_donor, &pid, &true);
@@ -2818,7 +2820,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Already voted on this proposal")]
     fn test_double_vote_prevented() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let voter = Address::generate(&env);
         grant_badge(&env, &cid, &voter);
@@ -2828,7 +2830,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proposal_approved() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         // 2 approve, 1 rejects
         for i in 0..3u32 {
@@ -2847,7 +2849,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proposal_rejected() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         // 1 approves, 2 reject
         for i in 0..3u32 {
@@ -2866,7 +2868,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proposal_tie_rejected_with_rejection_event() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
 
         for i in 0..2u32 {
@@ -2892,7 +2894,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Voting window not yet closed")]
     fn test_resolve_before_deadline_fails() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         client.resolve_proposal(&pid);
     }
@@ -2900,7 +2902,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Proposal already resolved")]
     fn test_double_resolve_fails() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         extend_ttl(&env, &cid);
         env.ledger().set_sequence_number(VOTING_WINDOW_LEDGERS + 2);
@@ -2912,7 +2914,7 @@ mod tests {
 
     #[test]
     fn test_veto_proposal() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         extend_ttl(&env, &cid);
         client.veto_proposal(&admin, &pid);
@@ -2923,7 +2925,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only admin can veto proposals")]
     fn test_veto_proposal_non_admin_fails() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let imposter = Address::generate(&env);
         client.veto_proposal(&imposter, &pid);
@@ -2944,7 +2946,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Proposal already resolved")]
     fn test_veto_proposal_double_veto_fails() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         extend_ttl(&env, &cid);
         client.veto_proposal(&admin, &pid);
@@ -2956,7 +2958,7 @@ mod tests {
     /// A non-zero `duration_ledgers` within bounds is honored verbatim.
     #[test]
     fn test_create_proposal_custom_duration() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let custom: u32 = 5_000;
         let start = env.ledger().sequence();
         client.create_proposal(&admin, &pid, &custom);
@@ -2967,7 +2969,7 @@ mod tests {
     /// `0` means "use the default 7-day window".
     #[test]
     fn test_create_proposal_zero_duration_uses_default() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let start = env.ledger().sequence();
         client.create_proposal(&admin, &pid, &0u32);
         let p = client.get_proposal(&pid);
@@ -2977,21 +2979,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "Voting duration too short")]
     fn test_create_proposal_rejects_too_short_duration() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &(MIN_VOTING_WINDOW_LEDGERS - 1));
     }
 
     #[test]
     #[should_panic(expected = "Voting duration too long")]
     fn test_create_proposal_rejects_too_long_duration() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &(MAX_VOTING_WINDOW_LEDGERS + 1));
     }
 
     #[test]
     #[should_panic(expected = "CO2 per XLM exceeds maximum")]
     fn test_register_project_rejects_excessive_co2_per_xlm() {
-        let (env, _cid, client, admin, _pid) = setup();
+        let (env, _cid, client, admin, _pid) = crate::tests::setup();
         let pid2 = String::from_str(&env, "proj-002");
         let wallet = Address::generate(&env);
         client.register_project(
@@ -3007,7 +3009,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "CO2 per XLM exceeds maximum")]
     fn test_batch_register_projects_rejects_excessive_co2_per_xlm() {
-        let (env, _cid, client, admin, _pid) = setup();
+        let (env, _cid, client, admin, _pid) = crate::tests::setup();
         let project = ProjectInit {
             id: String::from_str(&env, "proj-002"),
             name: String::from_str(&env, "Bad Project"),
@@ -3058,7 +3060,7 @@ mod tests {
 
     #[test]
     fn test_deactivate_all_projects() {
-        let (env, _cid, client, admin, pid1) = setup();
+        let (env, _cid, client, admin, pid1) = crate::tests::setup();
         let pid2 = String::from_str(&env, "proj-002");
         let wallet = Address::generate(&env);
         client.register_project(
@@ -3095,7 +3097,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Voting window has closed")]
     fn test_vote_rejected_after_deadline() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
 
         // Create a voter with badge
@@ -3113,7 +3115,7 @@ mod tests {
     /// Test that voting is allowed before the deadline (issue #209).
     #[test]
     fn test_vote_allowed_before_deadline() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         let start = env.ledger().sequence();
         client.create_proposal(&admin, &pid, &0u32);
 
@@ -3135,7 +3137,7 @@ mod tests {
     /// Test minimum voting duration enforcement (issue #209).
     #[test]
     fn test_minimum_voting_duration_enforced() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         let custom_duration = MIN_VOTING_WINDOW_LEDGERS;
         let start = env.ledger().sequence();
 
@@ -3159,7 +3161,7 @@ mod tests {
 
     #[test]
     fn test_mint_project_nft_success() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -3183,7 +3185,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Cumulative donation to this project has not reached 100 XLM")]
     fn test_mint_project_nft_below_threshold() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -3198,7 +3200,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Milestone NFT already minted for this project")]
     fn test_mint_project_nft_duplicate_prevented() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -3214,7 +3216,7 @@ mod tests {
 
     #[test]
     fn test_project_nft_independent_per_project() {
-        let (env, _cid, client, admin, pid1) = setup();
+        let (env, _cid, client, admin, pid1) = crate::tests::setup();
         let pid2    = String::from_str(&env, "proj-002");
         let wallet2 = Address::generate(&env);
         client.register_project(
@@ -3239,7 +3241,7 @@ mod tests {
 
     #[test]
     fn test_project_nft_cumulative_across_donations() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -3259,7 +3261,7 @@ mod tests {
 
     #[test]
     fn test_refund_donation_reverses_totals_and_transfers_funds() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let donor = Address::generate(&env);
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -3290,7 +3292,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only admin can refund donations")]
     fn test_refund_donation_rejects_non_admin_caller() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let not_admin = Address::generate(&env);
         let donor = Address::generate(&env);
         let token_admin = Address::generate(&env);
@@ -3464,3 +3466,5 @@ mod tests {
         client.donate_usdc(&token, &donor, &pid, &-1i128, &0u32);
     }
 }
+
+
