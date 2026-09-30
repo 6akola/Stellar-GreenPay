@@ -231,6 +231,20 @@ pub struct ImpactSummary {
     pub donor_stats: DonorStats,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractError {
+    InvalidUrl = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectMetadataUrls {
+    pub website_url: String,
+    pub cover_image_url: String,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -258,6 +272,7 @@ pub enum DataKey {
     ProjectMilestoneNFT(String, Address),
     // Metadata IPFS storage
     ProjectMetadata(String),
+    ProjectMetadataUrls(String),
     // Contract upgrade and multi-currency support
     ContractWasmHash,
     USDCTokenAddress,
@@ -645,6 +660,52 @@ impl GreenPayContract {
             (Symbol::new(&env, "meta_updated"), project_id),
             (admin, ipfs_cid),
         );
+    }
+
+    pub fn update_project_metadata(
+        env: Env,
+        admin: Address,
+        project_id: String,
+        website_url: String,
+        cover_image_url: String,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(project_id.clone()))
+            .expect("Project not found");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+
+        if stored_admin != admin && project.wallet != admin {
+            panic!("Only admin or project wallet can set metadata");
+        }
+
+        if !is_valid_metadata_url(&website_url) || !is_valid_metadata_url(&cover_image_url) {
+            return Err(ContractError::InvalidUrl);
+        }
+
+        env.storage().instance().set(
+            &DataKey::ProjectMetadataUrls(project_id),
+            &ProjectMetadataUrls {
+                website_url,
+                cover_image_url,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn get_project_metadata_urls(env: Env, project_id: String) -> ProjectMetadataUrls {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProjectMetadataUrls(project_id))
+            .expect("Project metadata URLs not found")
     }
 
     /// Deactivate all active projects at once. Admin only.
@@ -2194,6 +2255,57 @@ mod tests {
     }
 
     // ─── Existing tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_project_metadata_rejects_http_url() {
+        let (env, _cid, client, admin, pid) = setup();
+        let valid_website_url = String::from_str(&env, "https://example.org");
+        let http_url = String::from_str(&env, "http://example.org");
+
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &http_url, &valid_website_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &valid_website_url, &http_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+    }
+
+    #[test]
+    fn test_update_project_metadata_rejects_url_over_500_characters() {
+        let (env, _cid, client, admin, pid) = setup();
+        let mut oversized_url = [b'a'; 501];
+        oversized_url[..8].copy_from_slice(b"https://");
+        let long_url = String::from_bytes(&env, &oversized_url);
+        let valid_url = String::from_str(&env, "https://example.org/cover.png");
+
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &long_url, &valid_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &valid_url, &long_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+    }
+
+    #[test]
+    fn test_update_project_metadata_stores_valid_urls() {
+        let (env, _cid, client, admin, pid) = setup();
+        let website_url = String::from_str(&env, "https://example.org");
+        let cover_image_url = String::from_str(&env, "https://example.org/cover.png");
+
+        client.update_project_metadata(&admin, &pid, &website_url, &cover_image_url);
+
+        assert_eq!(
+            client.get_project_metadata_urls(&pid),
+            ProjectMetadataUrls {
+                website_url,
+                cover_image_url,
+            },
+        );
+    }
 
     #[test]
     fn test_initialize() {
