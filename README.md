@@ -142,6 +142,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 Please note that this project is governed by a [Code of Conduct](CODE_OF_CONDUCT.md). By participating, you agree to uphold its terms.
 
+### 🔒 Security
+
+To report a vulnerability, follow the responsible disclosure process in [SECURITY.md](SECURITY.md) — please do **not** open a public issue for security reports.
+
 ### Secret Scanning
 
 Every push and every pull request to `main` runs Gitleaks with the repo-local `.gitleaks.toml` config. Any detected secret fails CI, so keep real credentials out of source control; use `.env` files locally and GitHub encrypted secrets for CI/deployment values. The allowlist only covers generated archives, env templates, and deterministic test fixtures.
@@ -164,3 +168,13 @@ See [ROADMAP.md](ROADMAP.md) for planned features.
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE)
+Optimized transaction settlement logic to accelerate payment verification workflows.
+​Updated Stellar SDK configurations and network payload definitions.
+​Enhanced inline comments across payment processing routines for clarity.
+​Corrected outdated environment configurations and build settings.
+​Clarified testing procedures for validating green payment ledger transactions.
+​Standardized error reporting response structures across API handlers.
+​Strengthened security protocols regarding account key management and signatures.
+​Resolved formatting inconsistencies across main project documentation.
+​Added step-by-step instructions for deploying service components to production.
+​Updated system status logging and network health monitoring utilities.
