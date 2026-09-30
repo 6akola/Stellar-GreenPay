@@ -8,6 +8,7 @@ import EditProfileForm from "@/components/EditProfileForm";
 import ProjectCard from "@/components/ProjectCard";
 import ImpactCertificate from "@/components/ImpactCertificate";
 import ProjectRating from "@/components/ProjectRating";
+import ReferralSection from "@/components/ReferralSection";
 import { fetchProfile, fetchDonorHistory, fetchProjects } from "@/lib/api";
 import { getDueMonthlySubscriptions } from "@/lib/monthlyGiving";
 import { getXLMBalance, getFriendBotFunding, NETWORK } from "@/lib/stellar";
@@ -283,6 +284,9 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
 
       {activeTab === 'impact' ? (
         <div className="space-y-8 animate-slide-up">
+          {/* Referral Section */}
+          <ReferralSection publicKey={publicKey} />
+
           {/* Certificate */}
           <div className="card">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
