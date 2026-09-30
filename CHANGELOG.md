@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The selected language persists across sessions under `greenpay:locale` (migrated from the bare `locale` key), falls back to `navigator.language`, and sets `<html lang>` before first paint instead of re-rendering after hydration (#1073).
 
 
+### Fixed
+
+- Kubernetes manifests now pin container images to immutable git-SHA tags instead of the mutable `latest` tag, with CI injecting the short SHA at deploy time (#1212).
+
 ## [1.0.0] - 2025-01-01
 
 ### Added
