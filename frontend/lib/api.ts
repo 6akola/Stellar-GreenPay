@@ -360,6 +360,46 @@ export async function fetchDonorHistory(publicKey: string) {
   return data.data;
 }
 
+// ── Referrals ────────────────────────────────────────────────────────────────
+/**
+ * Fetch referral stats for a wallet (referral count, bonus earned, referrer).
+ *
+ * @param publicKey - Donor Stellar public key.
+ * @returns Referral stats.
+ * @throws If the request fails.
+ */
+export async function fetchReferralStats(publicKey: string): Promise<{
+  referralCount: number;
+  referralBonusXLM: string;
+  referredBy: string | null;
+}> {
+  const { data } = await api.get<{ success: boolean; data: {
+    referralCount: number;
+    referralBonusXLM: string;
+    referredBy: string | null;
+  } }>(`/api/referrals/${publicKey}`);
+  return data.data;
+}
+
+/**
+ * Record a referral relationship (referrer → referred).
+ *
+ * @param referrerAddress - Referrer's Stellar public key.
+ * @param referredAddress - Referred donor's Stellar public key.
+ * @returns The referral record.
+ * @throws If the request fails.
+ */
+export async function createReferral(
+  referrerAddress: string,
+  referredAddress: string,
+): Promise<unknown> {
+  const { data } = await api.post<{ success: boolean; data: unknown }>(
+    "/api/referrals",
+    { referrerAddress, referredAddress },
+  );
+  return data.data;
+}
+
 // ── Donation history export ──────────────────────────────────────────────────
 /**
  * Download the authenticated donor's full donation history as a CSV file.

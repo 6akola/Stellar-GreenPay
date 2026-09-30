@@ -144,6 +144,9 @@ app.use("/api/v1/ratings", require("./routes/ratings"));
 // Team giving (corporate/group donation profiles).
 app.use("/api/teams", require("./routes/teams"));
 app.use("/api/v1/teams", require("./routes/teams"));
+// Referral program (track referrals, award badge XP bonuses).
+app.use("/api/referrals", require("./routes/referrals"));
+app.use("/api/v1/referrals", require("./routes/referrals"));
 app.use((req, res) => res.status(404).json({ error: `${req.method} ${req.path} not found` }));
 // Sentry error handler — capture exceptions before the final error middleware
 app.use(sentryErrorMiddleware());
