@@ -71,20 +71,14 @@ const MODERATED_IMAGE_MIME = new Set([
  * Allowed MIME types based on detected file content (magic bytes), not
  * on client-supplied Content-Type header. This prevents attacks that
  * spoof the Content-Type header to upload executable files.
+ * 
+ * Restricted to image formats and PDF only for security.
  */
 const ALLOWED_MIME = new Set([
   "application/pdf",
   "image/png",
   "image/jpeg",
   "image/webp",
-  "image/gif",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.ms-excel",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "text/plain",
-  "text/csv",
-  "application/zip",
 ]);
 
 const memory = multer({
@@ -161,7 +155,7 @@ router.post("/", uploadRateLimiter, (req, res, next) => {
         "Rejected upload: detected MIME type not in whitelist"
       );
       return res.status(415).json({
-        error: `Unsupported file type: ${detectedMimeType}. Allowed: PDF, images, Office docs, CSV, plain text, ZIP.`,
+        error: `Unsupported file type: ${detectedMimeType}. Allowed: PDF, PNG, JPEG, WebP.`,
       });
     }
 
