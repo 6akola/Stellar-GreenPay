@@ -169,6 +169,8 @@ components:
           type: string
         raisedXLM:
           type: string
+        raisedUSDC:
+          type: string
         donorCount:
           type: integer
         co2OffsetKg:
@@ -222,6 +224,8 @@ components:
         goalXLM:
           type: string
         raisedXLM:
+          type: string
+        raisedUSDC:
           type: string
         deadline:
           type: string
@@ -1709,6 +1713,21 @@ paths:
                     type: boolean
                   data:
                     $ref: '#/components/schemas/StatsGlobal'
+  /api/stats/trends:
+    get:
+      tags: [Stats]
+      summary: Get week-over-week donation growth
+      description: >
+        Returns donation totals for the current 7-day window and the preceding
+        7-day window, along with the percentage growth. Used by the admin
+        analytics dashboard to show donation trend indicators.
+      responses:
+        '200':
+          description: Week-over-week trend data.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsTrends'
   /api/stats/categories:
     get:
       tags: [Stats]

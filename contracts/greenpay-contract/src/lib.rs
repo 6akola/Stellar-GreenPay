@@ -25,22 +25,52 @@ mod fuzz_tests;
  *     --source alice --network testnet
  */
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
     token, Address, Env, symbol_short, Symbol, String, BytesN, Vec,
 };
 
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    InvalidPageSize = 1,
+}
+
+
 // ─── Oracle interface ─────────────────────────────────────────────────────────
 
-/// External price oracle interface.
-/// Any on-chain contract implementing `get_price` can serve as the oracle.
-/// `get_price` returns the number of XLM stroops equivalent to 1 USDC stroop.
-/// Example: if 1 USDC = 8 XLM, return 8.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OracleAsset {
+    Stellar(Address),
+    Other(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OraclePriceData {
+    pub price: i128,
+    pub timestamp: u64,
+}
+
+/// SEP-40 methods used from the configured Reflector Pulse oracle.
 #[contractclient(name = "OracleClient")]
 pub trait OracleInterface {
-    fn get_price(env: Env) -> i128;
+    fn decimals(env: Env) -> u32;
+    fn lastprice(env: Env, asset: OracleAsset) -> Option<OraclePriceData>;
+    fn resolution(env: Env) -> u32;
 }
 
 // ─── Badge tiers (on-chain) ───────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    Reentrant = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +118,24 @@ pub struct DonationRecord {
     pub ledger: u32,
     pub message_hash: u32,
     pub currency: Symbol, // "XLM" or "USDC"
+}
+
+/// Input for batch donation - project ID and amount pair
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchDonation {
+    pub project_id: String,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DonateEvent {
+    pub donor: Address,
+    pub project_id: String,
+    pub amount: i128,
+    pub co2_offset: i128,
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -183,6 +231,20 @@ pub struct ImpactSummary {
     pub donor_stats: DonorStats,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractError {
+    InvalidUrl = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectMetadataUrls {
+    pub website_url: String,
+    pub cover_image_url: String,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -210,6 +272,7 @@ pub enum DataKey {
     ProjectMilestoneNFT(String, Address),
     // Metadata IPFS storage
     ProjectMetadata(String),
+    ProjectMetadataUrls(String),
     // Contract upgrade and multi-currency support
     ContractWasmHash,
     USDCTokenAddress,
@@ -218,11 +281,24 @@ pub enum DataKey {
     // Contract-wide emergency pause status
     Paused,
     PendingAdmin,
+    // Configurable staleness bound for oracle price quotes (issue #1146)
+    MaxPriceAgeSecs,
+    // Reentrancy guard
+    IsProcessing,
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const STROOP: i128 = 10_000_000;
+/// USDC uses six decimal places.
+const USDC_SCALE: i128 = 1_000_000;
+/// Reject quotes older than three oracle update intervals.
+const ORACLE_MAX_AGE_MULTIPLIER: u64 = 3;
+/// Default ceiling on oracle price age, in seconds, used unless the admin
+/// has configured a different value via `set_max_price_age`. A stale price
+/// (older than this, or than `ORACLE_MAX_AGE_MULTIPLIER` update intervals,
+/// whichever is stricter) is rejected in `donate_usdc`.
+const DEFAULT_MAX_PRICE_AGE_SECS: u64 = 3600;
 
 // 7 days × 24 h × 3600 s ÷ 5 s per ledger ≈ 120_960 ledgers — used as the
 // default when `create_proposal` is called without an explicit duration.
@@ -237,6 +313,10 @@ const MAX_VOTING_WINDOW_LEDGERS: u32 = 518_400; // 30 days @ 5s/ledger
 // Upper bound on co2_per_xlm at registration — prevents donate-time CO₂ overflow
 // panics and misleading impact figures from misconfigured projects.
 const MAX_CO2_PER_XLM: u32 = 100_000;
+
+// Maximum page size for paginated queries to protect contract resource limits
+pub const MAX_PAGE_SIZE: u32 = 100;
+
 
 fn calculate_badge(total_stroops: i128) -> BadgeTier {
     let xlm = total_stroops / STROOP;
@@ -464,7 +544,12 @@ impl GreenPayContract {
         project.active = false;
         env.storage()
             .instance()
-            .set(&DataKey::Project(project_id), &project);
+            .set(&DataKey::Project(project_id.clone()), &project);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProjectDeactivated"), admin),
+            project_id,
+        );
     }
 
     pub fn pause_project(env: Env, admin: Address, project_id: String) {
@@ -478,6 +563,58 @@ impl GreenPayContract {
         project.active = false;
         env.storage().instance().set(&DataKey::Project(project_id), &project);
     }
+
+    /// Set the CO2 offset rate for a project (in kg CO₂ per XLM).
+    /// Enforces: 1 <= rate <= 1_000_000.
+    pub fn set_co2_rate(
+        env: Env,
+        admin: Address,
+        project_id: String,
+        rate: u64,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if stored_admin != admin {
+            panic!("Only admin can update CO2 rate");
+        }
+
+        if rate < MIN_CO2_RATE || rate > MAX_CO2_RATE {
+            return Err(ContractError::InvalidCo2Rate);
+        }
+
+        let mut project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(project_id.clone()))
+            .expect("Project not found");
+
+        project.co2_per_xlm = rate as u32;
+        env.storage()
+            .instance()
+            .set(&DataKey::Project(project_id.clone()), &project);
+
+        env.events().publish(
+            (Symbol::new(&env, "co2_rate_updated"), admin),
+            (project_id, rate),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the CO2 offset rate for a project.
+    pub fn get_co2_rate(env: Env, project_id: String) -> u64 {
+        let project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(project_id))
+            .expect("Project not found");
+        project.co2_per_xlm as u64
+    }
+
 
     // ─── Project Metadata ───────────────────────────────────────────────────
 
@@ -525,6 +662,52 @@ impl GreenPayContract {
         );
     }
 
+    pub fn update_project_metadata(
+        env: Env,
+        admin: Address,
+        project_id: String,
+        website_url: String,
+        cover_image_url: String,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        let project: Project = env
+            .storage()
+            .instance()
+            .get(&DataKey::Project(project_id.clone()))
+            .expect("Project not found");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+
+        if stored_admin != admin && project.wallet != admin {
+            panic!("Only admin or project wallet can set metadata");
+        }
+
+        if !is_valid_metadata_url(&website_url) || !is_valid_metadata_url(&cover_image_url) {
+            return Err(ContractError::InvalidUrl);
+        }
+
+        env.storage().instance().set(
+            &DataKey::ProjectMetadataUrls(project_id),
+            &ProjectMetadataUrls {
+                website_url,
+                cover_image_url,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn get_project_metadata_urls(env: Env, project_id: String) -> ProjectMetadataUrls {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProjectMetadataUrls(project_id))
+            .expect("Project metadata URLs not found")
+    }
+
     /// Deactivate all active projects at once. Admin only.
     /// Iterates the project ID list stored during `register_project`.
     pub fn deactivate_all_projects(env: Env, admin: Address) {
@@ -552,6 +735,11 @@ impl GreenPayContract {
         amount: i128,
         msg_hash: u32,
     ) {
+        if env.storage().temporary().has(&DataKey::IsProcessing) {
+            panic_with_error!(&env, ContractError::Reentrant);
+        }
+        env.storage().temporary().set(&DataKey::IsProcessing, &true);
+
         donor.require_auth();
         if Self::is_paused(env.clone()) {
             panic!("Contract is paused");
@@ -637,6 +825,7 @@ impl GreenPayContract {
 
         // Auto-mint an Impact NFT when a donor reaches a new badge tier.
         if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+            env.events().publish((soroban_sdk::Symbol::new(&env, "BadgeUpgraded"), donor.clone()), donor_stats.badge.clone());
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -707,6 +896,211 @@ impl GreenPayContract {
         env.events().publish(
             (symbol_short!("donated"), donor.clone(), project_id.clone()),
             (amount, donor_stats.badge.clone(), msg_hash),
+        );
+        let timestamp = env.ledger().timestamp();
+        let co2_offset = co2_increment;
+        env.events().publish(
+            ("donate",),
+            &DonateEvent {
+                donor,
+                project_id,
+                amount,
+                co2_offset,
+                timestamp,
+            },
+        );
+        env.storage().instance().extend_ttl(VOTING_WINDOW_LEDGERS * 4, VOTING_WINDOW_LEDGERS * 4);
+        env.storage().temporary().remove(&DataKey::IsProcessing);
+    }
+
+    /// Batch donate to multiple projects in a single atomic transaction
+    /// Accepts a vector of (project_id, amount) pairs and processes all donations
+    /// as a single transaction, reducing gas costs and signature prompts
+    pub fn batch_donate(
+        env: Env,
+        token: Address,
+        donor: Address,
+        donations: Vec<BatchDonation>,
+        msg_hash: u32,
+    ) {
+        donor.require_auth();
+        if Self::is_paused(env.clone()) {
+            panic!("Contract is paused");
+        }
+        if donations.is_empty() {
+            panic!("Donations list cannot be empty");
+        }
+        if donations.len() > 10 {
+            panic!("Maximum 10 projects per batch donation");
+        }
+
+        let mut donor_stats: DonorStats = env
+            .storage()
+            .instance()
+            .get(&DataKey::DonorStats(donor.clone()))
+            .unwrap_or(DonorStats {
+                total_donated: 0,
+                donation_count: 0,
+                badge: BadgeTier::None,
+                co2_offset_grams: 0,
+            });
+        let prev_badge = donor_stats.badge.clone();
+
+        let mut total_amount: i128 = 0;
+        let mut total_co2: i128 = 0;
+
+        for batch_item in donations.iter() {
+            let project_id = batch_item.project_id.clone();
+            let amount = batch_item.amount;
+
+            if amount <= 0 {
+                panic!("Donation amount must be positive");
+            }
+
+            let mut project: Project = env
+                .storage()
+                .instance()
+                .get(&DataKey::Project(project_id.clone()))
+                .expect("Project not found");
+            if !project.active {
+                panic!("Project is not accepting donations");
+            }
+            if amount < project.min_donation_amount {
+                panic!("Donation below minimum");
+            }
+
+            let xlm_units = amount / STROOP;
+            let co2_increment = xlm_units
+                .checked_mul(project.co2_per_xlm as i128)
+                .expect("CO2 calculation overflow");
+
+            project.total_raised = project
+                .total_raised
+                .checked_add(amount)
+                .expect("Project total_raised overflow");
+            let donated_key = DataKey::HasDonated(project_id.clone(), donor.clone());
+            if !env.storage().instance().has(&donated_key) {
+                env.storage().instance().set(&donated_key, &true);
+                project.donor_count = project
+                    .donor_count
+                    .checked_add(1)
+                    .expect("Project donor_count overflow");
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::Project(project_id.clone()), &project);
+
+            total_amount = total_amount.checked_add(amount).expect("Total amount overflow");
+            total_co2 = total_co2.checked_add(co2_increment).expect("Total CO2 overflow");
+
+            // Track per-project cumulative donations
+            let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
+            let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
+            env.storage().instance().set(
+                &proj_total_key,
+                &prev_proj_total.checked_add(amount).expect("DonorProjectTotal overflow"),
+            );
+        }
+
+        // Update donor stats with totals from all donations
+        donor_stats.total_donated = donor_stats
+            .total_donated
+            .checked_add(total_amount)
+            .expect("Donor total_donated overflow");
+        donor_stats.donation_count = donor_stats
+            .donation_count
+            .checked_add(donations.len() as u32)
+            .expect("Donor donation_count overflow");
+        donor_stats.co2_offset_grams = donor_stats
+            .co2_offset_grams
+            .checked_add(total_co2)
+            .expect("Donor co2_offset overflow");
+        donor_stats.badge = calculate_badge(donor_stats.total_donated);
+        env.storage()
+            .instance()
+            .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
+
+        // Auto-mint Impact NFT on badge tier change
+        if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+            let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
+            if !env.storage().instance().has(&nft_key) {
+                let nft = ImpactNFT {
+                    owner: donor.clone(),
+                    tier: donor_stats.badge.clone(),
+                    total_donated: donor_stats.total_donated,
+                    minted_at_ledger: env.ledger().sequence(),
+                };
+                env.storage().instance().set(&nft_key, &nft);
+                env.events().publish(
+                    (symbol_short!("nft_mint"), donor.clone()),
+                    donor_stats.badge.clone(),
+                );
+            }
+        }
+
+        // Update global counters
+        let dc: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DonationCount)
+            .unwrap_or(0);
+        let new_dc = dc.checked_add(donations.len() as u32).expect("DonationCount overflow");
+        env.storage().instance().set(&DataKey::DonationCount, &new_dc);
+
+        let gr: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalTotalRaised)
+            .unwrap_or(0);
+        let new_gr = gr.checked_add(total_amount).expect("GlobalTotalRaised overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalTotalRaised, &new_gr);
+
+        let gc: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalCO2OffsetGrams)
+            .unwrap_or(0);
+        let new_gc = gc.checked_add(total_co2).expect("GlobalCO2 overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalCO2OffsetGrams, &new_gc);
+
+        // Transfer tokens to each project wallet
+        let token_client = token::Client::new(&env, &token);
+        for batch_item in donations.iter() {
+            let project: Project = env
+                .storage()
+                .instance()
+                .get(&DataKey::Project(batch_item.project_id.clone()))
+                .expect("Project not found");
+            token_client.transfer(&donor, &project.wallet, &batch_item.amount);
+            
+            // Record individual donation
+            let donation_record = DonationRecord {
+                donor: donor.clone(),
+                project: batch_item.project_id.clone(),
+                amount: batch_item.amount,
+                ledger: env.ledger().sequence(),
+                message_hash: msg_hash,
+                currency: symbol_short!("XLM"),
+            };
+            env.storage().instance().set(&DataKey::DonationRecord(dc), &donation_record);
+            
+            // Track in donor history
+            let mut donor_donations: Vec<u32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::DonorDonations(donor.clone()))
+                .unwrap_or(Vec::new(&env));
+            donor_donations.push_back(dc);
+            env.storage().instance().set(&DataKey::DonorDonations(donor.clone()), &donor_donations);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_donated"), donor.clone()),
+            (total_amount, donations.len() as u32),
         );
         env.storage().instance().extend_ttl(VOTING_WINDOW_LEDGERS * 4, VOTING_WINDOW_LEDGERS * 4);
     }
@@ -878,14 +1272,16 @@ impl GreenPayContract {
             .get(&DataKey::DonorDonations(donor))
             .unwrap_or(Vec::new(&env));
         let total_count = donation_ids.len();
+        let bounded_offset = offset.min(total_count);
 
-        if offset >= total_count || limit == 0 {
+        if bounded_offset >= total_count || limit == 0 {
             return Vec::new(&env);
         }
 
-        let end = core::cmp::min(offset.saturating_add(limit), total_count);
+        let bounded_limit = limit.min(total_count - bounded_offset);
+        let end = bounded_offset + bounded_limit;
         let mut result = Vec::new(&env);
-        let mut index = offset;
+        let mut index = bounded_offset;
         while index < end {
             if let Some(donation_id) = donation_ids.get(index) {
                 if let Some(record) = env
@@ -912,6 +1308,7 @@ impl GreenPayContract {
     /// A `Vec<Project>` containing up to `limit` projects starting from `offset`.
     /// If `offset` is greater than or equal to the total number of projects,
     /// returns an empty vector without panicking.
+    /// Returns `ContractError::InvalidPageSize` if `limit > MAX_PAGE_SIZE`.
     ///
     /// # Example
     /// ```ignore
@@ -920,7 +1317,15 @@ impl GreenPayContract {
     /// // Get next 10 projects
     /// let projects = contract.get_all_projects_paginated(10, 10);
     /// ```
-    pub fn get_all_projects_paginated(env: Env, offset: u32, limit: u32) -> Vec<Project> {
+    pub fn get_all_projects_paginated(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Project>, ContractError> {
+        if limit > MAX_PAGE_SIZE {
+            return Err(ContractError::InvalidPageSize);
+        }
+
         // Retrieve the list of project IDs, or empty vec if not yet initialized
         let project_ids: Vec<String> = env
             .storage()
@@ -932,7 +1337,7 @@ impl GreenPayContract {
         
         // If offset is out of bounds, return empty vec
         if offset >= total_count {
-            return Vec::new(&env);
+            return Ok(Vec::new(&env));
         }
         
         // Calculate the end bound: min(offset + limit, total_count).
@@ -942,7 +1347,7 @@ impl GreenPayContract {
         let end = if (offset as u64) + (limit as u64) > (total_count as u64) {
             total_count
         } else {
-            offset + limit
+            (offset + limit).min(total_count)
         };
 
         // Collect projects from the slice
@@ -961,8 +1366,9 @@ impl GreenPayContract {
             idx += 1;
         }
         
-        result
+        Ok(result)
     }
+
 
     pub fn get_admin(env: Env) -> Address {
         env.storage()
@@ -1341,7 +1747,8 @@ impl GreenPayContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Donate USDC. Converts to XLM-equivalent for global stats using a price oracle stub.
+    /// Donate USDC. Converts to an XLM-equivalent amount using the configured
+    /// on-chain price oracle.
     pub fn donate_usdc(
         env: Env,
         usdc_token: Address,
@@ -1350,6 +1757,11 @@ impl GreenPayContract {
         usdc_amount: i128,
         msg_hash: u32,
     ) {
+        if env.storage().temporary().has(&DataKey::IsProcessing) {
+            panic_with_error!(&env, ContractError::Reentrant);
+        }
+        env.storage().temporary().set(&DataKey::IsProcessing, &true);
+
         donor.require_auth();
         if Self::is_paused(env.clone()) {
             panic!("Contract is paused");
@@ -1363,15 +1775,49 @@ impl GreenPayContract {
             panic!("USDC token not configured");
         }
 
-        // Fetch the USDC→XLM price from the configured oracle.
-        // The oracle returns how many XLM stroops equal 1 USDC stroop.
+        // Fetch the latest USDC price from the configured XLM-base SEP-40
+        // oracle. The returned fixed-point precision is declared by decimals().
         let oracle_addr: Address = env.storage().instance()
             .get(&DataKey::OracleAddress).expect("Price oracle not configured");
         let oracle = OracleClient::new(&env, &oracle_addr);
-        let rate = oracle.get_price();
-        if rate <= 0 { panic!("Oracle returned invalid price"); }
+        let quote = oracle
+            .lastprice(&OracleAsset::Stellar(usdc_token.clone()))
+            .expect("Oracle price not available");
+        if quote.price <= 0 {
+            panic!("Oracle returned invalid price");
+        }
+        let resolution = oracle.resolution();
+        if resolution == 0 {
+            panic!("Oracle returned invalid resolution");
+        }
+        let now = env.ledger().timestamp();
+        let resolution_max_age = u64::from(resolution)
+            .checked_mul(ORACLE_MAX_AGE_MULTIPLIER)
+            .expect("Oracle max age overflow");
+        let configured_max_age = Self::get_max_price_age(env.clone());
+        // Enforce whichever bound is stricter: a fast-updating oracle still
+        // can't be trusted past MAX_PRICE_AGE_SECS, and a slow-updating one
+        // is still held to its own resolution-derived window.
+        let max_age = resolution_max_age.min(configured_max_age);
+        if quote.timestamp > now || now - quote.timestamp > max_age {
+            panic!("StalePriceData: oracle price is older than the maximum allowed age");
+        }
+        let price_scale = 10i128
+            .checked_pow(oracle.decimals())
+            .expect("Oracle decimals are too large");
+        let conversion_scale = USDC_SCALE
+            .checked_mul(price_scale)
+            .expect("Oracle conversion scale overflow");
         let xlm_equivalent = usdc_amount
-            .checked_mul(rate).expect("USDC to XLM conversion overflow");
+            .checked_mul(quote.price)
+            .expect("USDC to XLM conversion overflow")
+            .checked_mul(STROOP)
+            .expect("USDC to XLM stroop conversion overflow")
+            .checked_div(conversion_scale)
+            .expect("USDC to XLM conversion division failed");
+        if xlm_equivalent <= 0 {
+            panic!("Oracle conversion rounded donation to zero");
+        }
 
         let mut project: Project = env
             .storage()
@@ -1438,6 +1884,7 @@ impl GreenPayContract {
             .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
 
         if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+            env.events().publish((soroban_sdk::Symbol::new(&env, "BadgeUpgraded"), donor.clone()), donor_stats.badge.clone());
             let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
             if !env.storage().instance().has(&nft_key) {
                 let nft = ImpactNFT {
@@ -1519,6 +1966,7 @@ impl GreenPayContract {
             (symbol_short!("donated"), donor.clone(), project_id),
             (usdc_amount, symbol_short!("USDC"), msg_hash),
         );
+        env.storage().temporary().remove(&DataKey::IsProcessing);
     }
 
     // ─── Admin: refund a disputed or fraudulent donation ────────────────────
@@ -1627,8 +2075,16 @@ impl GreenPayContract {
         );
     }
 
-    /// Admin-only: Set the USDC token address for multi-currency donations.
-    pub fn set_usdc_token(env: Env, admin: Address, usdc_token: Address) {
+    /// Admin-only: Configure the USDC token and its price oracle.
+    ///
+    /// Both addresses are written atomically so `donate_usdc` cannot observe a
+    /// token configured without a matching oracle.
+    pub fn set_usdc_token(
+        env: Env,
+        admin: Address,
+        usdc_token: Address,
+        oracle: Address,
+    ) {
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -1641,8 +2097,11 @@ impl GreenPayContract {
         env.storage()
             .instance()
             .set(&DataKey::USDCTokenAddress, &usdc_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAddress, &oracle);
         env.events()
-            .publish((symbol_short!("usdc_set"),), usdc_token);
+            .publish((symbol_short!("usdc_set"),), (usdc_token, oracle));
     }
 
     /// Get the configured USDC token address.
@@ -1650,20 +2109,41 @@ impl GreenPayContract {
         env.storage().instance().get(&DataKey::USDCTokenAddress)
     }
 
-    /// Admin-only: Set the price oracle contract address used by `donate_usdc`.
-    /// The oracle must implement `OracleInterface::get_price()`.
-    pub fn set_oracle(env: Env, admin: Address, oracle: Address) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance()
-            .get(&DataKey::Admin).expect("Not initialized");
-        if stored_admin != admin { panic!("Only admin can set oracle"); }
-        env.storage().instance().set(&DataKey::OracleAddress, &oracle);
-        env.events().publish((symbol_short!("oracle"),), oracle);
-    }
-
     /// Get the configured price oracle address.
     pub fn get_oracle(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::OracleAddress)
+    }
+
+    /// Admin-only: configure the maximum age, in seconds, an oracle price
+    /// quote may have before `donate_usdc` rejects it as stale (issue #1146).
+    /// Defaults to `DEFAULT_MAX_PRICE_AGE_SECS` (3600) until set.
+    pub fn set_max_price_age(env: Env, admin: Address, max_age_secs: u64) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if stored_admin != admin {
+            panic!("Only admin can set max price age");
+        }
+        if max_age_secs == 0 {
+            panic!("Max price age must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPriceAgeSecs, &max_age_secs);
+        env.events()
+            .publish((symbol_short!("maxage"),), max_age_secs);
+    }
+
+    /// Get the configured maximum oracle price age in seconds, falling back
+    /// to `DEFAULT_MAX_PRICE_AGE_SECS` when unset.
+    pub fn get_max_price_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPriceAgeSecs)
+            .unwrap_or(DEFAULT_MAX_PRICE_AGE_SECS)
     }
 
     /// Admin-only: Upgrade the contract to a new WASM code.
@@ -1698,22 +2178,27 @@ impl GreenPayContract {
 
 // ─── Mock oracle (test / integration use only) ────────────────────────────────
 
-/// A minimal oracle that returns a fixed rate of 8 XLM per 1 USDC.
-/// Deploy this in tests and local integration environments via `set_oracle`.
-///
-/// Expected OracleInterface for real integrations:
-///   - Deploy a contract that implements `get_price(env: Env) -> i128`
-///   - `get_price` must return the number of XLM stroops per 1 USDC stroop
-///   - The admin registers it via `GreenPayContract::set_oracle(admin, oracle_address)`
-///
-/// Example real oracle sources: Band Protocol, DIA, or a custom TWAP contract.
+/// A minimal SEP-40 oracle that returns a fixed rate of 8 XLM per 1 USDC.
+/// Deploy this in tests and local integration environments via
+/// `set_usdc_token(admin, usdc_token, oracle)`.
 #[contract]
 pub struct MockOracle;
 
 #[contractimpl]
 impl OracleInterface for MockOracle {
-    fn get_price(_env: Env) -> i128 {
-        8
+    fn decimals(_env: Env) -> u32 {
+        6
+    }
+
+    fn lastprice(env: Env, _asset: OracleAsset) -> Option<OraclePriceData> {
+        Some(OraclePriceData {
+            price: 8_000_000,
+            timestamp: env.ledger().timestamp(),
+        })
+    }
+
+    fn resolution(_env: Env) -> u32 {
+        300
     }
 }
 
@@ -1725,7 +2210,102 @@ mod tests {
     use soroban_sdk::token::StellarAssetClient;
     use super::*;
 
+    #[contract]
+    struct FractionalMockOracle;
+
+    #[contractimpl]
+    impl OracleInterface for FractionalMockOracle {
+        fn decimals(_env: Env) -> u32 {
+            6
+        }
+
+        fn lastprice(env: Env, _asset: OracleAsset) -> Option<OraclePriceData> {
+            Some(OraclePriceData {
+                price: 2_500_000,
+                timestamp: env.ledger().timestamp(),
+            })
+        }
+
+        fn resolution(_env: Env) -> u32 {
+            300
+        }
+    }
+
+    /// Returns a quote with a fixed timestamp so tests can advance the
+    /// ledger clock to simulate a stale or fresh price (issue #1146).
+    #[contract]
+    struct TimestampedMockOracle;
+
+    #[contractimpl]
+    impl OracleInterface for TimestampedMockOracle {
+        fn decimals(_env: Env) -> u32 {
+            6
+        }
+
+        fn lastprice(_env: Env, _asset: OracleAsset) -> Option<OraclePriceData> {
+            Some(OraclePriceData {
+                price: 8_000_000,
+                timestamp: 1_000,
+            })
+        }
+
+        fn resolution(_env: Env) -> u32 {
+            300
+        }
+    }
+
     // ─── Existing tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_project_metadata_rejects_http_url() {
+        let (env, _cid, client, admin, pid) = setup();
+        let valid_website_url = String::from_str(&env, "https://example.org");
+        let http_url = String::from_str(&env, "http://example.org");
+
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &http_url, &valid_website_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &valid_website_url, &http_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+    }
+
+    #[test]
+    fn test_update_project_metadata_rejects_url_over_500_characters() {
+        let (env, _cid, client, admin, pid) = setup();
+        let mut oversized_url = [b'a'; 501];
+        oversized_url[..8].copy_from_slice(b"https://");
+        let long_url = String::from_bytes(&env, &oversized_url);
+        let valid_url = String::from_str(&env, "https://example.org/cover.png");
+
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &long_url, &valid_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+        assert_eq!(
+            client.try_update_project_metadata(&admin, &pid, &valid_url, &long_url),
+            Err(Ok(ContractError::InvalidUrl)),
+        );
+    }
+
+    #[test]
+    fn test_update_project_metadata_stores_valid_urls() {
+        let (env, _cid, client, admin, pid) = setup();
+        let website_url = String::from_str(&env, "https://example.org");
+        let cover_image_url = String::from_str(&env, "https://example.org/cover.png");
+
+        client.update_project_metadata(&admin, &pid, &website_url, &cover_image_url);
+
+        assert_eq!(
+            client.get_project_metadata_urls(&pid),
+            ProjectMetadataUrls {
+                website_url,
+                cover_image_url,
+            },
+        );
+    }
 
     #[test]
     fn test_initialize() {
@@ -1808,13 +2388,12 @@ mod tests {
 
         #[test]
     fn test_get_donation_record() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         // Set up USDC token and oracle
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
-        client.set_usdc_token(&admin, &token);
         let oracle_id = env.register_contract(None, MockOracle);
-        client.set_oracle(&admin, &oracle_id);
+        client.set_usdc_token(&admin, &token, &oracle_id);
         let donor = Address::generate(&env);
         // Mint USDC to donor
         StellarAssetClient::new(&env, &token).mint(&donor, &(100 * 1_000_000i128));
@@ -1828,8 +2407,89 @@ mod tests {
     }
 
     #[test]
+    fn test_usdc_donation_uses_configured_oracle_rate() {
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let oracle = env.register_contract(None, FractionalMockOracle);
+
+        client.set_usdc_token(&admin, &token, &oracle);
+        assert_eq!(client.get_usdc_token(), Some(token.clone()));
+        assert_eq!(client.get_oracle(), Some(oracle));
+
+        let donor = Address::generate(&env);
+        let usdc_amount = 4_000_000i128;
+        StellarAssetClient::new(&env, &token).mint(&donor, &usdc_amount);
+        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &0u32);
+
+        // 4 USDC at 2.5 XLM per USDC = 10 XLM, represented in stroops.
+        assert_eq!(client.get_global_total(), 10 * STROOP);
+    }
+
+    // ─── Issue #1146: oracle price staleness ─────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "StalePriceData")]
+    fn test_donate_usdc_rejects_stale_oracle_price() {
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let oracle = env.register_contract(None, TimestampedMockOracle);
+        client.set_usdc_token(&admin, &token, &oracle);
+
+        let donor = Address::generate(&env);
+        let usdc_amount = 4_000_000i128;
+        StellarAssetClient::new(&env, &token).mint(&donor, &usdc_amount);
+
+        // The mock quote's timestamp is fixed at 1_000. Advance the ledger
+        // clock 2 hours past it — older than DEFAULT_MAX_PRICE_AGE_SECS
+        // (3600s) and the resolution-derived window alike.
+        env.ledger().set_timestamp(1_000 + 7_200);
+
+        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &0u32);
+    }
+
+    #[test]
+    fn test_donate_usdc_accepts_fresh_oracle_price() {
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let oracle = env.register_contract(None, TimestampedMockOracle);
+        client.set_usdc_token(&admin, &token, &oracle);
+
+        let donor = Address::generate(&env);
+        let usdc_amount = 4_000_000i128;
+        StellarAssetClient::new(&env, &token).mint(&donor, &usdc_amount);
+
+        // Advance the clock by only 60s past the quote's fixed timestamp -
+        // well within both the default and resolution-derived windows.
+        env.ledger().set_timestamp(1_000 + 60);
+
+        client.donate_usdc(&token, &donor, &pid, &usdc_amount, &0u32);
+
+        assert_eq!(client.get_donation_count(), 1);
+    }
+
+    #[test]
+    fn test_set_max_price_age_is_admin_gated_and_persists() {
+        let (env, _cid, client, admin, _pid) = crate::tests::setup();
+        assert_eq!(client.get_max_price_age(), DEFAULT_MAX_PRICE_AGE_SECS);
+
+        client.set_max_price_age(&admin, &600u64);
+        assert_eq!(client.get_max_price_age(), 600u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only admin can set max price age")]
+    fn test_set_max_price_age_rejects_non_admin() {
+        let (env, _cid, client, _admin, _pid) = crate::tests::setup();
+        let attacker = Address::generate(&env);
+        client.set_max_price_age(&attacker, &600u64);
+    }
+
+    #[test]
     fn test_get_donor_history() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         env.mock_all_auths();
         let donor = Address::generate(&env);
         let wallet = Address::generate(&env);
@@ -1837,9 +2497,8 @@ mod tests {
         let token_client = StellarAssetClient::new(&env, &token);
         token_client.mint(&donor, &i128::MAX);
 
-        // No donations yet — empty result.
-        let history = client.get_donor_history(&donor, &0, &10);
-        assert_eq!(history.len(), 0);
+        let empty_history = client.get_donor_history(&donor, &0, &10);
+        assert_eq!(empty_history.len(), 0);
 
         // Donate XLM three times.
         for i in 1..=3 {
@@ -1852,16 +2511,43 @@ mod tests {
         assert_eq!(history.get(1).unwrap().amount, 200 * STROOP);
         assert_eq!(history.get(2).unwrap().amount, 300 * STROOP);
 
-        // Pagination: offset=1, limit=2 → gets second and third donation.
         let page = client.get_donor_history(&donor, &1, &2);
         assert_eq!(page.len(), 2);
         assert_eq!(page.get(0).unwrap().amount, 200 * STROOP);
         assert_eq!(page.get(1).unwrap().amount, 300 * STROOP);
 
-        // Pagination: offset=5 → empty.
-        let empty = client.get_donor_history(&donor, &5, &10);
-        assert_eq!(empty.len(), 0);
+        let offset_and_limit_beyond_end = client.get_donor_history(&donor, &1, &u32::MAX);
+        assert_eq!(offset_and_limit_beyond_end.len(), 2);
+        assert_eq!(offset_and_limit_beyond_end.get(0).unwrap().amount, 200 * STROOP);
+        assert_eq!(offset_and_limit_beyond_end.get(1).unwrap().amount, 300 * STROOP);
+
+        let offset_beyond_end = client.get_donor_history(&donor, &u32::MAX, &u32::MAX);
+        assert_eq!(offset_beyond_end.len(), 0);
     }
+
+    #[test]
+    fn test_get_all_projects_paginated_page_size_cap() {
+        let (_env, _cid, client, _admin, _pid) = setup();
+
+        // request 200 items -> error
+        let err_200 = client.try_get_all_projects_paginated(&0, &200);
+        assert_eq!(err_200, Err(Ok(ContractError::InvalidPageSize)));
+
+        // request 101 items -> error
+        let err_101 = client.try_get_all_projects_paginated(&0, &101);
+        assert_eq!(err_101, Err(Ok(ContractError::InvalidPageSize)));
+
+        // request 100 items -> success
+        let ok_100 = client.try_get_all_projects_paginated(&0, &100);
+        assert!(ok_100.is_ok());
+        let projects = ok_100.unwrap().unwrap();
+        assert!(!projects.is_empty());
+
+        // direct call with 100 items -> success
+        let direct_projects = client.get_all_projects_paginated(&0, &100);
+        assert!(!direct_projects.is_empty());
+    }
+
 
     #[test]
     fn test_get_global_stats_initial_zeros() {
@@ -2008,6 +2694,20 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Project already registered")]
+    fn test_register_project_duplicate_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let wallet = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_project(&String::from_str(&env, "proj-dup"), &String::from_str(&env, "First"), &wallet, &100, &1);
+        client.register_project(&String::from_str(&env, "proj-dup"), &String::from_str(&env, "Second"), &wallet, &100, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Project already registered")]
     fn test_batch_register_projects_duplicate_fails() {
         let env    = Env::default();
         env.mock_all_auths();
@@ -2040,7 +2740,7 @@ mod tests {
     // ─── Governance helpers ───────────────────────────────────────────────────
 
     /// Set up a fresh contract with one registered project.
-    fn setup() -> (
+    pub fn setup() -> (
         Env,
         soroban_sdk::Address,
         GreenPayContractClient<'static>,
@@ -2092,7 +2792,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_preserves_donation_state_and_storage_keys() {
-        let (env, cid, client_v1, _admin, pid) = setup();
+        let (env, cid, client_v1, _admin, pid) = crate::tests::setup();
         let donor = Address::generate(&env);
         let token_admin = Address::generate(&env);
         let token = env
@@ -2191,7 +2891,7 @@ mod tests {
 
     #[test]
     fn test_create_proposal() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let p = client.get_proposal(&pid);
         assert_eq!(p.votes_for, 0);
@@ -2203,14 +2903,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Proposal already exists for this project")]
     fn test_create_duplicate_proposal_fails() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         client.create_proposal(&admin, &pid, &0u32);
     }
 
     #[test]
     fn test_cast_vote() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let voter = Address::generate(&env);
         grant_badge(&env, &cid, &voter);
@@ -2223,7 +2923,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only badge holders (Seedling or above) can vote")]
     fn test_non_badge_holder_cannot_vote() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let non_donor = Address::generate(&env);
         client.vote_verify_project(&non_donor, &pid, &true);
@@ -2232,7 +2932,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Already voted on this proposal")]
     fn test_double_vote_prevented() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let voter = Address::generate(&env);
         grant_badge(&env, &cid, &voter);
@@ -2242,7 +2942,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proposal_approved() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         // 2 approve, 1 rejects
         for i in 0..3u32 {
@@ -2261,7 +2961,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proposal_rejected() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         // 1 approves, 2 reject
         for i in 0..3u32 {
@@ -2280,7 +2980,7 @@ mod tests {
 
     #[test]
     fn test_resolve_proposal_tie_rejected_with_rejection_event() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
 
         for i in 0..2u32 {
@@ -2306,7 +3006,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Voting window not yet closed")]
     fn test_resolve_before_deadline_fails() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         client.resolve_proposal(&pid);
     }
@@ -2314,7 +3014,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Proposal already resolved")]
     fn test_double_resolve_fails() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         extend_ttl(&env, &cid);
         env.ledger().set_sequence_number(VOTING_WINDOW_LEDGERS + 2);
@@ -2326,7 +3026,7 @@ mod tests {
 
     #[test]
     fn test_veto_proposal() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         extend_ttl(&env, &cid);
         client.veto_proposal(&admin, &pid);
@@ -2337,7 +3037,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only admin can veto proposals")]
     fn test_veto_proposal_non_admin_fails() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         let imposter = Address::generate(&env);
         client.veto_proposal(&imposter, &pid);
@@ -2358,7 +3058,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Proposal already resolved")]
     fn test_veto_proposal_double_veto_fails() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
         extend_ttl(&env, &cid);
         client.veto_proposal(&admin, &pid);
@@ -2370,7 +3070,7 @@ mod tests {
     /// A non-zero `duration_ledgers` within bounds is honored verbatim.
     #[test]
     fn test_create_proposal_custom_duration() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let custom: u32 = 5_000;
         let start = env.ledger().sequence();
         client.create_proposal(&admin, &pid, &custom);
@@ -2381,7 +3081,7 @@ mod tests {
     /// `0` means "use the default 7-day window".
     #[test]
     fn test_create_proposal_zero_duration_uses_default() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let start = env.ledger().sequence();
         client.create_proposal(&admin, &pid, &0u32);
         let p = client.get_proposal(&pid);
@@ -2391,21 +3091,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "Voting duration too short")]
     fn test_create_proposal_rejects_too_short_duration() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &(MIN_VOTING_WINDOW_LEDGERS - 1));
     }
 
     #[test]
     #[should_panic(expected = "Voting duration too long")]
     fn test_create_proposal_rejects_too_long_duration() {
-        let (_env, _cid, client, admin, pid) = setup();
+        let (_env, _cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &(MAX_VOTING_WINDOW_LEDGERS + 1));
     }
 
     #[test]
     #[should_panic(expected = "CO2 per XLM exceeds maximum")]
     fn test_register_project_rejects_excessive_co2_per_xlm() {
-        let (env, _cid, client, admin, _pid) = setup();
+        let (env, _cid, client, admin, _pid) = crate::tests::setup();
         let pid2 = String::from_str(&env, "proj-002");
         let wallet = Address::generate(&env);
         client.register_project(
@@ -2421,7 +3121,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "CO2 per XLM exceeds maximum")]
     fn test_batch_register_projects_rejects_excessive_co2_per_xlm() {
-        let (env, _cid, client, admin, _pid) = setup();
+        let (env, _cid, client, admin, _pid) = crate::tests::setup();
         let project = ProjectInit {
             id: String::from_str(&env, "proj-002"),
             name: String::from_str(&env, "Bad Project"),
@@ -2434,8 +3134,45 @@ mod tests {
     }
 
     #[test]
+    fn test_set_co2_rate_validation() {
+        let (_env, _cid, client, admin, pid) = setup();
+
+        // rate = 0 -> error (ContractError::InvalidCo2Rate)
+        let err_zero = client.try_set_co2_rate(&admin, &pid, &0);
+        assert_eq!(err_zero, Err(Ok(ContractError::InvalidCo2Rate)));
+
+        // rate = u64::MAX -> error (ContractError::InvalidCo2Rate)
+        let err_max = client.try_set_co2_rate(&admin, &pid, &u64::MAX);
+        assert_eq!(err_max, Err(Ok(ContractError::InvalidCo2Rate)));
+
+        // rate = 1_000_001 (above MAX_CO2_RATE) -> error
+        let err_above = client.try_set_co2_rate(&admin, &pid, &1_000_001);
+        assert_eq!(err_above, Err(Ok(ContractError::InvalidCo2Rate)));
+
+        // valid rate -> stored
+        let valid_rate = 500u64;
+        let res = client.try_set_co2_rate(&admin, &pid, &valid_rate);
+        assert!(res.is_ok());
+
+        let project = client.get_project(&pid);
+        assert_eq!(project.co2_per_xlm, 500);
+        assert_eq!(client.get_co2_rate(&pid), 500);
+
+        // boundary rate: 1 (min) -> stored
+        assert!(client.try_set_co2_rate(&admin, &pid, &1).is_ok());
+        assert_eq!(client.get_project(&pid).co2_per_xlm, 1);
+        assert_eq!(client.get_co2_rate(&pid), 1);
+
+        // boundary rate: 1_000_000 (max) -> stored
+        assert!(client.try_set_co2_rate(&admin, &pid, &1_000_000).is_ok());
+        assert_eq!(client.get_project(&pid).co2_per_xlm, 1_000_000);
+        assert_eq!(client.get_co2_rate(&pid), 1_000_000);
+    }
+
+
+    #[test]
     fn test_deactivate_all_projects() {
-        let (env, _cid, client, admin, pid1) = setup();
+        let (env, _cid, client, admin, pid1) = crate::tests::setup();
         let pid2 = String::from_str(&env, "proj-002");
         let wallet = Address::generate(&env);
         client.register_project(
@@ -2457,11 +3194,22 @@ mod tests {
         assert!(!client.get_project(&pid2).active);
     }
 
+    #[test]
+    fn test_deactivate_project_emits_event() {
+        let (env, _cid, client, admin, pid) = setup();
+        assert!(client.get_project(&pid).active);
+
+        client.deactivate_project(&admin, &pid);
+        assert!(env.events().all().events().len() > 0);
+
+        assert!(!client.get_project(&pid).active);
+    }
+
     /// Test that voting is rejected after the deadline has passed (issue #209).
     #[test]
     #[should_panic(expected = "Voting window has closed")]
     fn test_vote_rejected_after_deadline() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         client.create_proposal(&admin, &pid, &0u32);
 
         // Create a voter with badge
@@ -2479,7 +3227,7 @@ mod tests {
     /// Test that voting is allowed before the deadline (issue #209).
     #[test]
     fn test_vote_allowed_before_deadline() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         let start = env.ledger().sequence();
         client.create_proposal(&admin, &pid, &0u32);
 
@@ -2501,7 +3249,7 @@ mod tests {
     /// Test minimum voting duration enforcement (issue #209).
     #[test]
     fn test_minimum_voting_duration_enforced() {
-        let (env, cid, client, admin, pid) = setup();
+        let (env, cid, client, admin, pid) = crate::tests::setup();
         let custom_duration = MIN_VOTING_WINDOW_LEDGERS;
         let start = env.ledger().sequence();
 
@@ -2525,7 +3273,7 @@ mod tests {
 
     #[test]
     fn test_mint_project_nft_success() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -2549,7 +3297,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Cumulative donation to this project has not reached 100 XLM")]
     fn test_mint_project_nft_below_threshold() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -2564,7 +3312,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Milestone NFT already minted for this project")]
     fn test_mint_project_nft_duplicate_prevented() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -2580,7 +3328,7 @@ mod tests {
 
     #[test]
     fn test_project_nft_independent_per_project() {
-        let (env, _cid, client, admin, pid1) = setup();
+        let (env, _cid, client, admin, pid1) = crate::tests::setup();
         let pid2    = String::from_str(&env, "proj-002");
         let wallet2 = Address::generate(&env);
         client.register_project(
@@ -2605,7 +3353,7 @@ mod tests {
 
     #[test]
     fn test_project_nft_cumulative_across_donations() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let donor        = Address::generate(&env);
         let token_admin  = Address::generate(&env);
         let token        = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -2625,7 +3373,7 @@ mod tests {
 
     #[test]
     fn test_refund_donation_reverses_totals_and_transfers_funds() {
-        let (env, _cid, client, admin, pid) = setup();
+        let (env, _cid, client, admin, pid) = crate::tests::setup();
         let donor = Address::generate(&env);
         let token_admin = Address::generate(&env);
         let token = env.register_stellar_asset_contract_v2(token_admin).address();
@@ -2656,7 +3404,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Only admin can refund donations")]
     fn test_refund_donation_rejects_non_admin_caller() {
-        let (env, _cid, client, _admin, pid) = setup();
+        let (env, _cid, client, _admin, pid) = crate::tests::setup();
         let not_admin = Address::generate(&env);
         let donor = Address::generate(&env);
         let token_admin = Address::generate(&env);
@@ -2664,4 +3412,171 @@ mod tests {
 
         client.refund_donation(&not_admin, &pid, &donor, &(10 * STROOP), &token);
     }
+
+    // ─── Minimum donation enforcement (#1043) ─────────────────────────────────
+
+    /// Minimum used by the guard tests below: 10 XLM, expressed in stroops.
+    const TEST_MIN_DONATION: i128 = 10 * STROOP;
+
+    /// Fresh contract holding one project with a 10 XLM minimum donation, and a
+    /// donor funded with 100 XLM of the donation token.
+    fn setup_min_donation() -> (
+        Env,
+        GreenPayContractClient<'static>,
+        Address,
+        String,
+        Address,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, GreenPayContract);
+        let client = GreenPayContractClient::new(&env, &cid);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let pid = String::from_str(&env, "proj-min-donation");
+        let wallet = Address::generate(&env);
+        client.register_project(
+            &admin,
+            &pid,
+            &String::from_str(&env, "Minimum Guard Project"),
+            &wallet,
+            &100u32,
+            &TEST_MIN_DONATION,
+        );
+
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let donor = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&donor, &(100 * STROOP));
+
+        (env, client, token, pid, donor, wallet)
+    }
+
+    /// The exact scenario from #1043: a single stroop sent to a project that
+    /// configured a 10 XLM minimum must not be accepted.
+    #[test]
+    #[should_panic(expected = "Donation below minimum")]
+    fn test_donate_one_stroop_below_ten_xlm_minimum_is_rejected() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        client.donate(&token, &donor, &pid, &1i128, &0u32);
+    }
+
+    /// Boundary case: one stroop under the minimum is still under the minimum.
+    #[test]
+    #[should_panic(expected = "Donation below minimum")]
+    fn test_donate_just_below_minimum_is_rejected() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        client.donate(&token, &donor, &pid, &(TEST_MIN_DONATION - 1), &0u32);
+    }
+
+    /// A rejected donation must leave no trace: no funds moved, no accounting.
+    #[test]
+    fn test_donate_below_minimum_leaves_state_untouched() {
+        let (env, client, token, pid, donor, wallet) = setup_min_donation();
+
+        let attempted = client.try_donate(&token, &donor, &pid, &1i128, &0u32);
+        assert!(attempted.is_err());
+
+        let project = client.get_project(&pid);
+        assert_eq!(project.total_raised, 0);
+        assert_eq!(client.get_donation_count(), 0);
+        assert_eq!(client.get_global_total(), 0);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&wallet), 0);
+        assert_eq!(token_client.balance(&donor), 100 * STROOP);
+    }
+
+    /// Donating exactly the minimum is allowed — the guard is `<`, not `<=`.
+    #[test]
+    fn test_donate_at_exact_minimum_succeeds() {
+        let (env, client, token, pid, donor, wallet) = setup_min_donation();
+
+        client.donate(&token, &donor, &pid, &TEST_MIN_DONATION, &0u32);
+
+        let project = client.get_project(&pid);
+        assert_eq!(project.total_raised, TEST_MIN_DONATION);
+        assert_eq!(client.get_donation_count(), 1);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&wallet), TEST_MIN_DONATION);
+        assert_eq!(
+            token_client.balance(&donor),
+            100 * STROOP - TEST_MIN_DONATION,
+        );
+    }
+
+    /// Comfortably above the minimum still succeeds.
+    #[test]
+    fn test_donate_above_minimum_succeeds() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        let amount = TEST_MIN_DONATION * 2;
+        client.donate(&token, &donor, &pid, &amount, &0u32);
+
+        assert_eq!(client.get_project(&pid).total_raised, amount);
+        assert_eq!(client.get_donation_count(), 1);
+    }
+
+    // ─── Non-positive amount guard (issue #1058) ─────────────────────────────
+
+    /// amount == 0 must be rejected before any project lookup or state change.
+    #[test]
+    #[should_panic(expected = "Donation amount must be positive")]
+    fn test_donate_zero_amount_is_rejected() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        client.donate(&token, &donor, &pid, &0i128, &0u32);
+    }
+
+    /// Negative amounts must be rejected too.
+    #[test]
+    #[should_panic(expected = "Donation amount must be positive")]
+    fn test_donate_negative_amount_is_rejected() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        client.donate(&token, &donor, &pid, &-1i128, &0u32);
+    }
+
+    /// A rejected zero donation must leave no trace: no funds moved, no accounting.
+    #[test]
+    fn test_donate_zero_amount_leaves_state_untouched() {
+        let (env, client, token, pid, donor, wallet) = setup_min_donation();
+
+        let attempted = client.try_donate(&token, &donor, &pid, &0i128, &0u32);
+        assert!(attempted.is_err());
+
+        let project = client.get_project(&pid);
+        assert_eq!(project.total_raised, 0);
+        assert_eq!(client.get_donation_count(), 0);
+        assert_eq!(client.get_global_total(), 0);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&wallet), 0);
+        assert_eq!(token_client.balance(&donor), 100 * STROOP);
+    }
+
+    /// donate_usdc mirrors the same guard, checked before token/oracle lookups.
+    #[test]
+    #[should_panic(expected = "Donation amount must be positive")]
+    fn test_donate_usdc_zero_amount_is_rejected() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        client.donate_usdc(&token, &donor, &pid, &0i128, &0u32);
+    }
+
+    /// Negative USDC amounts are rejected the same way.
+    #[test]
+    #[should_panic(expected = "Donation amount must be positive")]
+    fn test_donate_usdc_negative_amount_is_rejected() {
+        let (_env, client, token, pid, donor, _wallet) = setup_min_donation();
+
+        client.donate_usdc(&token, &donor, &pid, &-1i128, &0u32);
+    }
 }
+
+
