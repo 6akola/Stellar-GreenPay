@@ -8,7 +8,7 @@ import EditProfileForm from "@/components/EditProfileForm";
 import ProjectCard from "@/components/ProjectCard";
 import ImpactCertificate from "@/components/ImpactCertificate";
 import ProjectRating from "@/components/ProjectRating";
-import { fetchProfile, fetchDonorHistory, fetchProjects, fetchMyTeam, createTeam, joinTeam } from "@/lib/api";
+import { fetchProfile, fetchDonorHistory, fetchProjects, fetchMyTeam, createTeam, joinTeam, exportDonationHistoryCsv } from "@/lib/api";
 import { getDueMonthlySubscriptions } from "@/lib/monthlyGiving";
 import { getXLMBalance, getFriendBotFunding, NETWORK } from "@/lib/stellar";
 import { formatXLM, formatCO2, timeAgo, shortenAddress, badgeEmoji, badgeLabel, calculateStreak } from "@/utils/format";
@@ -40,6 +40,7 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
   const [joinTeamId, setJoinTeamId] = useState("");
   const [joinInviteCode, setJoinInviteCode] = useState("");
   const [teamActionState, setTeamActionState] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [exportState, setExportState] = useState<"idle" | "loading" | "error">("idle");
 
   useEffect(() => {
     if (!publicKey) return;
@@ -221,6 +222,17 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
       setTeamError(msg || "Could not join team.");
       setTeamActionState("error");
+    }
+  };
+
+  const handleExportCsv = async () => {
+    setExportState("loading");
+    try {
+      await exportDonationHistoryCsv();
+      setExportState("idle");
+    } catch (err: unknown) {
+      setExportState("error");
+      window.setTimeout(() => setExportState("idle"), 3000);
     }
   };
 
@@ -605,9 +617,24 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
 
           {/* Donation history */}
           <div className="card shadow-sm border border-forest-100/50">
-            <h2 className="font-display text-lg font-semibold text-forest-900 mb-5 flex items-center gap-2">
-              <span>📜</span> Donation History
-            </h2>
+            <div className="flex items-center justify-between gap-3 mb-5">
+              <h2 className="font-display text-lg font-semibold text-forest-900 flex items-center gap-2">
+                <span>📜</span> Donation History
+              </h2>
+              <div className="flex items-center gap-2">
+                {exportState === "error" && (
+                  <span className="text-xs text-red-600 font-body">Export failed — try again</span>
+                )}
+                <button
+                  onClick={handleExportCsv}
+                  disabled={exportState === "loading"}
+                  className="btn-secondary text-xs py-1.5 px-3 disabled:opacity-60"
+                  title="Download your full donation history as a CSV for tax purposes"
+                >
+                  {exportState === "loading" ? "Exporting…" : "Export CSV"}
+                </button>
+              </div>
+            </div>
             {loading ? (
               <div className="space-y-3">
                 {[1,2,3].map(i => <div key={i} className="h-16 bg-forest-50 rounded-xl animate-pulse"/>)}
