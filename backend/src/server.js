@@ -134,6 +134,8 @@ app.get("/api/csrf-token", csrfTokenHandler);
 app.get("/api/v1/csrf-token", csrfTokenHandler);
 
 app.use("/api/impact", require("./routes/impact"));
+app.use("/api/subscriptions", require("./routes/subscriptions"));
+app.use("/api/v1/subscriptions", require("./routes/subscriptions"));
 app.use("/api/referrals", require("./routes/referrals"));
 app.use("/api/v1/referrals", require("./routes/referrals"));
 // Recurring donation schedules are the source of truth for mobile (#1059):
