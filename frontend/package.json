@@ -19,7 +19,7 @@
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^16.2.0",
     "@vercel/og": "^0.11.1",
-    "axios": "^1.18.1",
+    "axios": "^1.19.0",
     "clsx": "^2.1.1",
     "date-fns": "^4.4.0",
     "html2canvas": "^1.4.1",
