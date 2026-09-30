@@ -48,8 +48,7 @@ const path = require("path");
 const fileType = require("file-type");
 const router = express.Router();
 const { uploadFile, backendName, UPLOAD_DIR } = require("../services/storage");
-const { generatePresignedPutUrl, isS3Configured } = require("../services/s3Presign");
-const moderation = require("../services/moderation");
+const { generatePresignedPutUrl } = require("../services/s3Presign");
 const { createRateLimiter } = require("../middleware/rateLimiter");
 const logger = require("../logger");
 
