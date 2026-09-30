@@ -31,6 +31,17 @@ jest.mock("../middleware/rateLimiter", () => ({
   createRateLimiter: jest.fn(() => (_req, _res, next) => next()),
 }));
 
+// The route serves a page from a Redis cache (issue #1093). These tests assert
+// on the SQL that reaches Postgres, so the cache must always miss. Without this,
+// a warm shared Redis — which CI provides, and which outlives a single test
+// file — answers the request and the mocked pool is never called, so every
+// assertion about the query fails. Cache behaviour itself is covered by
+// leaderboard.cache.test.js.
+jest.mock("../services/redis", () => ({
+  get: async () => null,
+  set: async () => {},
+}));
+
 const pool = require("../db/pool");
 const leaderboardRouter = require("./leaderboard");
 

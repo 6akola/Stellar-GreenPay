@@ -28,6 +28,15 @@ jest.mock("../middleware/rateLimiter", () => ({
   createRateLimiter: jest.fn(() => (_req, _res, next) => next()),
 }));
 
+// The route serves a page from a Redis cache (issue #1093). These tests assert
+// on the LIMIT/OFFSET that reaches Postgres, so the cache must always miss.
+// Without this, a warm shared Redis — which CI provides, and which outlives a
+// single test file — makes the mocked pool look unused and the suite fails.
+jest.mock("../services/redis", () => ({
+  get: async () => null,
+  set: async () => {},
+}));
+
 // ─── Imports ──────────────────────────────────────────────────────────────────
 
 const express = require("express");
