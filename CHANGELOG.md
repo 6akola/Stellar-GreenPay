@@ -62,3 +62,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Mobile app (React Native / Expo).
 - Browser extension.
 - Helm chart for Kubernetes deployment.
+
+### Changed
+
+- Standardized monorepo workspace layout across `backend`, `frontend`, `mobile`, `extension`, and `contracts` packages for initial `v1.0.0` baseline release.
+- Standardized release notes generation via `@semantic-release/changelog` in `.github/workflows/release.yml` to parse Conventional Commits into Keep a Changelog sections (#1290).
+
+### Fixed
+
+- Resolved initial Stellar Horizon testnet transaction confirmation handling and database migration ordering for `v1.0.0`.
+
+### Security
+
+- Enforced environment-variable-only secret configuration for Stellar and PostgreSQL credentials alongside Gitleaks secret scanning in CI.
+
+[Unreleased]: https://github.com/Emmy123222/Stellar-GreenPay/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Emmy123222/Stellar-GreenPay/releases/tag/v1.0.0
