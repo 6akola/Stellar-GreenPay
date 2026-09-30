@@ -131,6 +131,8 @@ app.get("/api/csrf-token", csrfTokenHandler);
 app.get("/api/v1/csrf-token", csrfTokenHandler);
 
 app.use("/api/impact", require("./routes/impact"));
+app.use("/api/referrals", require("./routes/referrals"));
+app.use("/api/v1/referrals", require("./routes/referrals"));
 // Recurring donation schedules are the source of truth for mobile (#1059):
 // the app reads them from here and treats AsyncStorage as an offline cache.
 app.use("/api/recurring-donations", require("./routes/recurringDonations"));

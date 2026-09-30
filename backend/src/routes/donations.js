@@ -275,6 +275,32 @@ async function recordDonation(req, res, next) {
     await client.query("COMMIT");
     inTransaction = false;
 
+    // Award referral bonus if this is the referred user's first donation
+    if (currency === "XLM") {
+      try {
+        const referralCheck = await pool.query(
+          `SELECT COUNT(*) as count FROM donations WHERE donor_address = $1`,
+          [donorAddress]
+        );
+        const donationCount = parseInt(referralCheck.rows[0]?.count || "0");
+        
+        // If this is the first donation, award referral bonus
+        if (donationCount === 1) {
+          await fetch(`${process.env.API_URL || "http://localhost:4000"}/api/v1/referrals/award-bonus`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              referredAddress: donorAddress,
+              donationId: recordedDonation.id,
+              amountXLM: parsedAmount.toString()
+            })
+          }).catch(err => logger.error("Failed to award referral bonus:", err));
+        }
+      } catch (err) {
+        logger.error("Referral bonus check failed:", err);
+      }
+    }
+
     await redis.deletePattern("projects:list:*");
     // The leaderboard aggregates the row just inserted, so every cached page is
     // now stale (issue #1093). Donations recorded out-of-band by the indexer are
