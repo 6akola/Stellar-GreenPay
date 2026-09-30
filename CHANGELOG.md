@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Configurable CPU/memory requests and limits (requests 100m/256Mi, limits 500m/512Mi) and a CPU-based (70%) Horizontal Pod Autoscaler for the GreenPay Helm chart (#1209).
+- Smart Contracts section in `CONTRIBUTING.md` covering Soroban test/build/WASM/deploy workflows and linking the deployment and integration docs (#1281).
 - CHANGELOG.md — project changelog tracking.
 - Per-donation CO₂ offset in donation API responses via `co2OffsetKg` field, computed as `amount_xlm × co2_per_xlm / 1000` across all donation endpoints (#365).
 - On-chain USDC to XLM price conversion through a configured oracle adapter (#345).
