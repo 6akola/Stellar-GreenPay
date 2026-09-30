@@ -1,7 +1,8 @@
 /**
  * pages/dashboard.tsx — Donor impact dashboard
  */
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import html2canvas from "html2canvas";
 import Link from "next/link";
 import WalletConnect from "@/components/WalletConnect";
 import EditProfileForm from "@/components/EditProfileForm";
@@ -19,11 +20,21 @@ import { useWishlist } from "@/hooks/useWishlist";
 
 interface DashboardProps { publicKey: string | null; onConnect: (pk: string) => void; }
 
+/** Turn a canvas data URL into a PNG file download (issue #1200). */
+function triggerCertificateDownload(dataUrl: string) {
+  const a = document.createElement("a");
+  a.href = dataUrl;
+  a.download = "impact-certificate.png";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
-  const [profile,   setProfile]   = useState<DonorProfile | null>(null);
+  const [profile, setProfile] = useState<DonorProfile | null>(null);
   const [donations, setDonations] = useState<Donation[]>([]);
-  const [balance,   setBalance]   = useState<string | null>(null);
-  const [loading,   setLoading]   = useState(true);
+  const [balance, setBalance] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<'impact' | 'saved'>('impact');
   const [savedProjects, setSavedProjects] = useState<ClimateProject[]>([]);
   const [allProjects, setAllProjects] = useState<ClimateProject[]>([]);
@@ -51,16 +62,16 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
       getXLMBalance(publicKey).catch(() => { setIsUnfunded(true); return null; }),
       fetchProjects(),
     ])
-      .then(([p, d, b, allProjects]) => { 
-        setProfile(p); 
-        setDonations(d); 
+      .then(([p, d, b, allProjects]) => {
+        setProfile(p);
+        setDonations(d);
         if (b !== null) {
           setBalance(b);
           setIsUnfunded(false);
         }
         setAllProjects(allProjects);
         setSavedProjects(allProjects.filter(proj => wishlist.includes(proj.id)));
-        
+
         // Fetch pending rating
         return fetch(`${process.env.NEXT_PUBLIC_API_URL || ""}/api/v1/ratings/pending?donorAddress=${publicKey}`);
       })
@@ -91,7 +102,7 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
   );
 
   const streak = calculateStreak(donations);
-  
+
   const handleFriendbot = async () => {
     if (!publicKey) return;
     setFriendbotState('loading');
@@ -106,7 +117,7 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
       setFriendbotState('error');
     }
   };
-  
+
   // Persistence for longest streak
   useEffect(() => {
     if (streak.longest > 0) {
@@ -116,6 +127,14 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
       }
     }
   }, [streak.longest]);
+
+  // ── Certificate image download (issue #1200) ───────────────────────────────
+  // The first click rasterizes the certificate DOM once; later clicks reuse
+  // the cached PNG until the donor's badge tier changes (the cache key), so
+  // repeated downloads never re-render the subtree or compete on the main
+  // thread.
+  const [certificateRendering, setCertificateRendering] = useState(false);
+  const certificateCanvasUrlRef = useRef<{ key: string; dataUrl: string } | null>(null);
 
   if (!publicKey) return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-16">
@@ -127,8 +146,8 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
     </div>
   );
 
-  const totalDonated  = profile?.totalDonatedXLM || "0";
-  const co2Estimate   = Math.round(parseFloat(totalDonated) * 12); // rough estimate
+  const totalDonated = profile?.totalDonatedXLM || "0";
+  const co2Estimate = Math.round(parseFloat(totalDonated) * 12); // rough estimate
   const projectsCount = profile?.projectsSupported || 0;
 
   const topBadgeTier = profile?.badges?.length ? profile.badges[0].tier : null;
@@ -187,56 +206,6 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
     );
   };
 
-  const handleCreateTeam = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newTeamName.trim()) return;
-    setTeamActionState("saving");
-    setTeamError(null);
-    try {
-      const team = await createTeam({ name: newTeamName.trim() });
-      setMyTeam(team);
-      setTeamForm("none");
-      setNewTeamName("");
-      setTeamActionState("success");
-      window.setTimeout(() => setTeamActionState("idle"), 2000);
-    } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setTeamError(msg || "Could not create team.");
-      setTeamActionState("error");
-    }
-  };
-
-  const handleJoinTeam = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!joinTeamId.trim() || !joinInviteCode.trim()) return;
-    setTeamActionState("saving");
-    setTeamError(null);
-    try {
-      const team = await joinTeam(joinTeamId.trim(), joinInviteCode.trim());
-      setMyTeam(team);
-      setTeamForm("none");
-      setJoinTeamId("");
-      setJoinInviteCode("");
-      setTeamActionState("success");
-      window.setTimeout(() => setTeamActionState("idle"), 2000);
-    } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setTeamError(msg || "Could not join team.");
-      setTeamActionState("error");
-    }
-  };
-
-  const handleExportCsv = async () => {
-    setExportState("loading");
-    try {
-      await exportDonationHistoryCsv();
-      setExportState("idle");
-    } catch (err: unknown) {
-      setExportState("error");
-      window.setTimeout(() => setExportState("idle"), 3000);
-    }
-  };
-
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 animate-fade-in">
 
@@ -254,7 +223,7 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
         <div>
           <h1 className="font-display text-3xl font-bold text-forest-900 mb-1">My Impact</h1>
           <div className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"/>
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
             <span className="address-tag">{shortenAddress(publicKey)}</span>
           </div>
         </div>
@@ -317,10 +286,10 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
       {/* Stats grid */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         {[
-          { icon: "💚", label: "Total Donated",     value: formatXLM(totalDonated) },
-          { icon: "♻️", label: "Est. CO₂ Offset",   value: formatCO2(co2Estimate) },
+          { icon: "💚", label: "Total Donated", value: formatXLM(totalDonated) },
+          { icon: "♻️", label: "Est. CO₂ Offset", value: formatCO2(co2Estimate) },
           { icon: "🌍", label: "Projects Supported", value: projectsCount.toString() },
-          { icon: "💰", label: "XLM Balance",        value: balance ? formatXLM(balance) : "—" },
+          { icon: "💰", label: "XLM Balance", value: balance ? formatXLM(balance) : "—" },
         ].map(stat => (
           <div key={stat.label} className="card text-center shadow-sm border border-forest-100/50">
             <p className="text-2xl mb-2">{stat.icon}</p>
@@ -371,10 +340,11 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
                   {showCertificate ? "Hide" : "Preview"}
                 </button>
                 <button
-                  onClick={handlePrintCertificate}
-                  className="px-5 py-2.5 rounded-xl text-sm font-semibold border border-forest-200 bg-forest-50 hover:bg-forest-100 transition-all"
+                  onClick={handleDownloadCertificate}
+                  disabled={certificateRendering || !showCertificate}
+                  className="px-5 py-2.5 rounded-xl text-sm font-semibold border border-forest-200 bg-forest-50 hover:bg-forest-100 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Download Certificate
+                  {certificateRendering ? "Rendering…" : "Download Certificate"}
                 </button>
                 <button
                   onClick={handleShareCertificate}
@@ -411,8 +381,8 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
                     {streak.current} Month Streak
                   </h2>
                   <p className="text-forest-200 text-sm font-body">
-                    {streak.current > 0 
-                      ? "Keep it up! Your monthly support drives long-term change." 
+                    {streak.current > 0
+                      ? "Keep it up! Your monthly support drives long-term change."
                       : "Start a monthly donation habit to build your streak!"}
                   </p>
                 </div>
@@ -423,8 +393,8 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
                   { m: 6, label: "6mo", emoji: "🥈" },
                   { m: 12, label: "12mo", emoji: "🥇" },
                 ].map(m => (
-                  <div 
-                    key={m.m} 
+                  <div
+                    key={m.m}
                     className={`flex flex-col items-center p-3 rounded-xl border transition-all ${streak.longest >= m.m ? 'bg-white/10 border-white/30' : 'bg-black/20 border-white/5 opacity-30'}`}
                     title={`${m.m} Month Milestone`}
                   >
@@ -641,7 +611,7 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
             </div>
             {loading ? (
               <div className="space-y-3">
-                {[1,2,3].map(i => <div key={i} className="h-16 bg-forest-50 rounded-xl animate-pulse"/>)}
+                {[1, 2, 3].map(i => <div key={i} className="h-16 bg-forest-50 rounded-xl animate-pulse" />)}
               </div>
             ) : donations.length === 0 ? (
               <div className="text-center py-12">

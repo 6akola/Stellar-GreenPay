@@ -150,15 +150,18 @@ export default function ProjectDetail({
       .finally(() => setLoading(false));
   }, [id, publicKey, router]);
 
-  const discussionLoading = Boolean(project) && discussionLoadedFor !== project?.walletAddress;
+  const projectWalletAddress = project?.walletAddress;
+  const projectId = project?.id;
+
+  const discussionLoading = Boolean(project) && discussionLoadedFor !== projectWalletAddress;
 
   useEffect(() => {
-    if (!project) return;
-    fetchProjectDiscussion(project.walletAddress, 50)
+    if (!projectWalletAddress) return;
+    fetchProjectDiscussion(projectWalletAddress, 50)
       .then(setDiscussion)
       .catch(() => setDiscussion([]))
-      .finally(() => setDiscussionLoadedFor(project.walletAddress));
-  }, [project?.walletAddress]);
+      .finally(() => setDiscussionLoadedFor(projectWalletAddress));
+  }, [projectWalletAddress]);
 
   useEffect(() => {
     if (!id) return;
@@ -221,7 +224,7 @@ export default function ProjectDetail({
 
   // Subscribe to badge_earned WebSocket events for this project
   useEffect(() => {
-    if (!project) return;
+    if (!projectId) return;
     let socket: any = null;
     let mounted = true;
 
@@ -232,12 +235,12 @@ export default function ProjectDetail({
         socket = io(base, { path: "/socket.io", transports: ["websocket"] });
 
         socket.on("connect", () => {
-          socket.emit("join_project", project.id);
+          socket.emit("join_project", projectId);
         });
 
         socket.on("badge_earned", (payload: { donorAddress: string; badge: string; projectId: string }) => {
           if (!mounted) return;
-          if (payload.projectId !== project.id) return;
+          if (payload.projectId !== projectId) return;
           setToasts((prev) => [
             ...prev,
             {
@@ -257,14 +260,14 @@ export default function ProjectDetail({
       mounted = false;
       try {
         if (socket) {
-          socket.emit("leave_project", project.id);
+          socket.emit("leave_project", projectId);
           if (typeof socket.disconnect === "function") socket.disconnect();
         }
       } catch (e) {
         // ignore
       }
     };
-  }, [project?.id]);
+  }, [projectId]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setCountdownNow(Date.now()), 1000);
@@ -987,6 +990,7 @@ export default function ProjectDetail({
           <div className="card">
             {project.imageUrl ? (
               <div className="mb-5 overflow-hidden rounded-3xl border border-forest-100 bg-forest-50">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={project.imageUrl}
                   alt={project.name}
