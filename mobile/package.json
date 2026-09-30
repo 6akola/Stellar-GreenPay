@@ -40,7 +40,7 @@
     "normalize-path": "^3.0.0",
     "react-test-renderer": "18.2.0",
     "to-regex-range": "^5.0.1",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   },
   "jest": {
     "preset": "jest-expo",
