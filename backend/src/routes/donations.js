@@ -316,11 +316,43 @@ router.post("/", donationLimiter, recordDonation);
 
 // GET /api/donations/stream
 router.get("/stream", (req, res) => {
+  const projectId = req.query.projectId || req.query.project_id || "default";
+  const lastEventId = req.headers["last-event-id"];
+
+  // When reconnecting, a Last-Event-ID that belongs to a different project
+  // than this stream is scoped to is rejected before committing to SSE.
+  if (lastEventId != null && lastEventId !== "") {
+    const lastIdNum = Number(lastEventId);
+    const lastEvent = Number.isNaN(lastIdNum)
+      ? undefined
+      : donationEvents.findEvent(lastIdNum);
+    if (lastEvent && lastEvent.projectId !== projectId) {
+      return res.status(400).json({
+        error: `Last-Event-ID ${lastEventId} does not belong to project ${projectId}`,
+      });
+    }
+  }
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.write("retry: 1000\n\n");
+
+  // Replay events missed since the Last-Event-ID. An unknown id is treated as
+  // a cold start and the full project history is replayed (stream reset).
+  if (lastEventId != null && lastEventId !== "") {
+    const lastIdNum = Number(lastEventId);
+    const lastEvent = Number.isNaN(lastIdNum)
+      ? undefined
+      : donationEvents.findEvent(lastIdNum);
+    const replay = lastEvent
+      ? donationEvents.getEventsAfter(projectId, lastIdNum)
+      : donationEvents.getEventsForProject(projectId);
+    for (const event of replay) {
+      res.write(`id: ${event.id}\ndata: ${JSON.stringify(event.data)}\n\n`);
+    }
+  }
 
   const onNewDonation = (donation) => {
     res.write(`data: ${JSON.stringify(donation)}\n\n`);
