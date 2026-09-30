@@ -1037,7 +1037,7 @@ impl GreenPayContract {
         }
 
         env.events().publish(
-            (symbol_short!("batch_donated"), donor.clone()),
+            (Symbol::new(&env, "batch_donated"), donor.clone()),
             (total_amount, donations.len() as u32),
         );
         env.storage().instance().extend_ttl(VOTING_WINDOW_LEDGERS * 4, VOTING_WINDOW_LEDGERS * 4);
