@@ -113,6 +113,14 @@ pub struct DonationRecord {
     pub currency: Symbol, // "XLM" or "USDC"
 }
 
+/// Input for batch donation - project ID and amount pair
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchDonation {
+    pub project_id: String,
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DonorStats {
@@ -745,6 +753,198 @@ impl GreenPayContract {
         env.events().publish(
             (symbol_short!("donated"), donor.clone(), project_id.clone()),
             (amount, donor_stats.badge.clone(), msg_hash),
+        );
+        env.storage().instance().extend_ttl(VOTING_WINDOW_LEDGERS * 4, VOTING_WINDOW_LEDGERS * 4);
+    }
+
+    /// Batch donate to multiple projects in a single atomic transaction
+    /// Accepts a vector of (project_id, amount) pairs and processes all donations
+    /// as a single transaction, reducing gas costs and signature prompts
+    pub fn batch_donate(
+        env: Env,
+        token: Address,
+        donor: Address,
+        donations: Vec<BatchDonation>,
+        msg_hash: u32,
+    ) {
+        donor.require_auth();
+        if Self::is_paused(env.clone()) {
+            panic!("Contract is paused");
+        }
+        if donations.is_empty() {
+            panic!("Donations list cannot be empty");
+        }
+        if donations.len() > 10 {
+            panic!("Maximum 10 projects per batch donation");
+        }
+
+        let mut donor_stats: DonorStats = env
+            .storage()
+            .instance()
+            .get(&DataKey::DonorStats(donor.clone()))
+            .unwrap_or(DonorStats {
+                total_donated: 0,
+                donation_count: 0,
+                badge: BadgeTier::None,
+                co2_offset_grams: 0,
+            });
+        let prev_badge = donor_stats.badge.clone();
+
+        let mut total_amount: i128 = 0;
+        let mut total_co2: i128 = 0;
+
+        for batch_item in donations.iter() {
+            let project_id = batch_item.project_id.clone();
+            let amount = batch_item.amount;
+
+            if amount <= 0 {
+                panic!("Donation amount must be positive");
+            }
+
+            let mut project: Project = env
+                .storage()
+                .instance()
+                .get(&DataKey::Project(project_id.clone()))
+                .expect("Project not found");
+            if !project.active {
+                panic!("Project is not accepting donations");
+            }
+            if amount < project.min_donation_amount {
+                panic!("Donation below minimum");
+            }
+
+            let xlm_units = amount / STROOP;
+            let co2_increment = xlm_units
+                .checked_mul(project.co2_per_xlm as i128)
+                .expect("CO2 calculation overflow");
+
+            project.total_raised = project
+                .total_raised
+                .checked_add(amount)
+                .expect("Project total_raised overflow");
+            let donated_key = DataKey::HasDonated(project_id.clone(), donor.clone());
+            if !env.storage().instance().has(&donated_key) {
+                env.storage().instance().set(&donated_key, &true);
+                project.donor_count = project
+                    .donor_count
+                    .checked_add(1)
+                    .expect("Project donor_count overflow");
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::Project(project_id.clone()), &project);
+
+            total_amount = total_amount.checked_add(amount).expect("Total amount overflow");
+            total_co2 = total_co2.checked_add(co2_increment).expect("Total CO2 overflow");
+
+            // Track per-project cumulative donations
+            let proj_total_key = DataKey::DonorProjectTotal(project_id.clone(), donor.clone());
+            let prev_proj_total: i128 = env.storage().instance().get(&proj_total_key).unwrap_or(0);
+            env.storage().instance().set(
+                &proj_total_key,
+                &prev_proj_total.checked_add(amount).expect("DonorProjectTotal overflow"),
+            );
+        }
+
+        // Update donor stats with totals from all donations
+        donor_stats.total_donated = donor_stats
+            .total_donated
+            .checked_add(total_amount)
+            .expect("Donor total_donated overflow");
+        donor_stats.donation_count = donor_stats
+            .donation_count
+            .checked_add(donations.len() as u32)
+            .expect("Donor donation_count overflow");
+        donor_stats.co2_offset_grams = donor_stats
+            .co2_offset_grams
+            .checked_add(total_co2)
+            .expect("Donor co2_offset overflow");
+        donor_stats.badge = calculate_badge(donor_stats.total_donated);
+        env.storage()
+            .instance()
+            .set(&DataKey::DonorStats(donor.clone()), &donor_stats);
+
+        // Auto-mint Impact NFT on badge tier change
+        if donor_stats.badge != BadgeTier::None && donor_stats.badge != prev_badge {
+            let nft_key = DataKey::ImpactNFT(donor.clone(), donor_stats.badge.clone());
+            if !env.storage().instance().has(&nft_key) {
+                let nft = ImpactNFT {
+                    owner: donor.clone(),
+                    tier: donor_stats.badge.clone(),
+                    total_donated: donor_stats.total_donated,
+                    minted_at_ledger: env.ledger().sequence(),
+                };
+                env.storage().instance().set(&nft_key, &nft);
+                env.events().publish(
+                    (symbol_short!("nft_mint"), donor.clone()),
+                    donor_stats.badge.clone(),
+                );
+            }
+        }
+
+        // Update global counters
+        let dc: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DonationCount)
+            .unwrap_or(0);
+        let new_dc = dc.checked_add(donations.len() as u32).expect("DonationCount overflow");
+        env.storage().instance().set(&DataKey::DonationCount, &new_dc);
+
+        let gr: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalTotalRaised)
+            .unwrap_or(0);
+        let new_gr = gr.checked_add(total_amount).expect("GlobalTotalRaised overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalTotalRaised, &new_gr);
+
+        let gc: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalCO2OffsetGrams)
+            .unwrap_or(0);
+        let new_gc = gc.checked_add(total_co2).expect("GlobalCO2 overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalCO2OffsetGrams, &new_gc);
+
+        // Transfer tokens to each project wallet
+        let token_client = token::Client::new(&env, &token);
+        for batch_item in donations.iter() {
+            let project: Project = env
+                .storage()
+                .instance()
+                .get(&DataKey::Project(batch_item.project_id.clone()))
+                .expect("Project not found");
+            token_client.transfer(&donor, &project.wallet, &batch_item.amount);
+            
+            // Record individual donation
+            let donation_record = DonationRecord {
+                donor: donor.clone(),
+                project: batch_item.project_id.clone(),
+                amount: batch_item.amount,
+                ledger: env.ledger().sequence(),
+                message_hash: msg_hash,
+                currency: symbol_short!("XLM"),
+            };
+            env.storage().instance().set(&DataKey::DonationRecord(dc), &donation_record);
+            
+            // Track in donor history
+            let mut donor_donations: Vec<u32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::DonorDonations(donor.clone()))
+                .unwrap_or(Vec::new(&env));
+            donor_donations.push_back(dc);
+            env.storage().instance().set(&DataKey::DonorDonations(donor.clone()), &donor_donations);
+        }
+
+        env.events().publish(
+            (symbol_short!("batch_donated"), donor.clone()),
+            (total_amount, donations.len() as u32),
         );
         env.storage().instance().extend_ttl(VOTING_WINDOW_LEDGERS * 4, VOTING_WINDOW_LEDGERS * 4);
     }
