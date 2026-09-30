@@ -67,7 +67,7 @@ async function recordDonation(req, res, next) {
 
     client = await pool.connect();
 
-    const projectResult = await client.query("SELECT id, co2_per_xlm, name FROM projects WHERE id = $1", [projectId]);
+    const projectResult = await client.query("SELECT id, co2_per_xlm, name, wallet_address FROM projects WHERE id = $1", [projectId]);
     if (!projectResult.rows[0]) { const e = new Error("Project not found"); e.status = 404; throw e; }
     const projectCo2PerXlm = projectResult.rows[0].co2_per_xlm;
 
@@ -286,6 +286,16 @@ async function recordDonation(req, res, next) {
       projectName,
       amountXLM: String(donationRow.amount_xlm ?? parsedAmount),
       donorBadge,
+    });
+
+    // Enqueue push notification to project admin (non-blocking)
+    enqueueDonationPushNotification({
+      projectId,
+      projectName,
+      amountXLM: String(donationRow.amount_xlm ?? parsedAmount),
+      donorBadge,
+    }).catch((err) => {
+      logger.error({ event: "donation_push_enqueue_error", projectId, err: err.message }, "Failed to enqueue donation push notification");
     });
 
     await checkAndDeliverMilestones(projectId).catch((err) => {
