@@ -430,6 +430,84 @@ function setStatus(message: string, isError = false) {
   }
 }
 
+const onboardingSteps = [
+  {
+    title: "What is GreenPay?",
+    description:
+      "GreenPay helps you discover climate projects and support them with Stellar payments.",
+  },
+  {
+    title: "Connect Freighter wallet",
+    description:
+      "Connect your Freighter wallet to GreenPay on the selected Stellar network. Review each request in Freighter before signing a donation.",
+  },
+  {
+    title: "Find your first project",
+    description:
+      "Choose an active climate project from the catalog or search for one to prepare your first donation.",
+  },
+];
+
+function renderOnboardingStep(overlay: HTMLElement, stepIndex: number) {
+  const step = onboardingSteps[stepIndex];
+  overlay.dataset.step = String(stepIndex + 1);
+  overlay.innerHTML = `
+    <section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+      <p class="onboarding-progress">Step ${stepIndex + 1} of ${onboardingSteps.length}</p>
+      <h2 id="onboarding-title" tabindex="-1">${step.title}</h2>
+      <p class="onboarding-description">${step.description}</p>
+      <p class="onboarding-error" role="status" aria-live="polite"></p>
+      <div class="onboarding-actions">
+        ${stepIndex > 0 ? '<button class="btn onboarding-back" type="button">Back</button>' : ""}
+        ${stepIndex < onboardingSteps.length - 1
+          ? '<button class="btn onboarding-next" type="button">Next</button>'
+          : '<button class="btn onboarding-done" type="button">Got it</button>'}
+      </div>
+    </section>
+  `;
+
+  overlay.querySelector<HTMLButtonElement>(".onboarding-back")?.addEventListener(
+    "click",
+    () => renderOnboardingStep(overlay, stepIndex - 1),
+  );
+  overlay.querySelector<HTMLButtonElement>(".onboarding-next")?.addEventListener(
+    "click",
+    () => renderOnboardingStep(overlay, stepIndex + 1),
+  );
+  overlay.querySelector<HTMLButtonElement>(".onboarding-done")?.addEventListener(
+    "click",
+    (event) => {
+      const button = event.currentTarget as HTMLButtonElement;
+      button.disabled = true;
+      chrome.storage.local.set({ onboarded: true }, () => {
+        if (chrome.runtime.lastError) {
+          button.disabled = false;
+          const error = overlay.querySelector<HTMLElement>(".onboarding-error");
+          if (error) error.textContent = "Could not save your progress. Please try again.";
+          return;
+        }
+        overlay.remove();
+      });
+    },
+  );
+
+  overlay.querySelector<HTMLElement>("#onboarding-title")?.focus();
+}
+
+function showOnboardingIfNeeded() {
+  chrome.storage.local.get(["onboarded"], (result: Record<string, unknown>) => {
+    if (result.onboarded === true) return;
+
+    const main = document.querySelector("main");
+    if (!main) return;
+
+    const overlay = document.createElement("div");
+    overlay.className = "onboarding-overlay";
+    main.appendChild(overlay);
+    renderOnboardingStep(overlay, 0);
+  });
+}
+
 async function initProjectSearch() {
   const searchInput = document.getElementById(
     "project-search",
@@ -478,6 +556,7 @@ async function initProjectSearch() {
 document.addEventListener("DOMContentLoaded", async () => {
   const settings = await loadSettings();
   applySettings(settings);
+  showOnboardingIfNeeded();
 
   // Check if Freighter is installed
   const freighter = (window as any).freighter;
