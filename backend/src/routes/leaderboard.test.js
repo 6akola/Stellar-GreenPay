@@ -34,8 +34,8 @@ jest.mock("../middleware/rateLimiter", () => ({
 const pool = require("../db/pool");
 const leaderboardRouter = require("./leaderboard");
 
-// leaderboard.js calls createRateLimiter(30, 1) exactly once, at module load
-// time (`const leaderboardLimiter = createRateLimiter(30, 1);`). That call
+// leaderboard.js calls createRateLimiter(30, 1, "leaderboard") exactly once,
+// at module load time. That call
 // already happened on the `require` above. jest.clearAllMocks() in later
 // beforeEach hooks wipes createRateLimiter.mock.calls, so we snapshot the
 // call args here, before any clearAllMocks runs, and assert against the
@@ -273,14 +273,37 @@ describe("leaderboard route SQL structure", () => {
   // LIMIT
   // -----------------------------------------------------------------------
 
-  test("respects limit parameter", async () => {
+  test("respects limit parameter by fetching pageSize + 1 rows", async () => {
     const app = createApp();
     await request(app).get("/api/leaderboard?limit=10");
 
     expect(queries[0].sql).toMatch(/LIMIT\s+\$1/i);
+    // The route fetches pageSize + 1 to detect a next page.
     expect(pool.query).toHaveBeenCalledWith(
       expect.any(String),
-      expect.arrayContaining([10]),
+      expect.arrayContaining([11]),
+    );
+  });
+
+  test("uses default limit of 50 when limit is not specified", async () => {
+    const app = createApp();
+    await request(app).get("/api/leaderboard");
+
+    // Default pageSize = 50, so it fetches 51 rows to detect a next page.
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringMatching(/LIMIT\s+\$1/i),
+      expect.arrayContaining([51]),
+    );
+  });
+
+  test("caps limit at the maximum of 200", async () => {
+    const app = createApp();
+    await request(app).get("/api/leaderboard?limit=10000");
+
+    // pageSize is clamped to 200, so it fetches 201 rows.
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.arrayContaining([201]),
     );
   });
 
@@ -548,12 +571,12 @@ describe("GET /api/leaderboard/history", () => {
 });
 
 describe("GET /api/leaderboard — rate limiting (issue #695)", () => {
-  test("createRateLimiter is called with (30, 1) — 30 req/min per IP", () => {
+  test("createRateLimiter is called with (30, 1, leaderboard) — 30 req/min per IP", () => {
     // See the module-load-time comment near the top of this file: this
     // checks the snapshot taken immediately after require(), since later
     // beforeEach hooks call jest.clearAllMocks() and would otherwise erase
     // the one-time call record.
-    expect(rateLimiterInitCall).toEqual([30, 1]);
+    expect(rateLimiterInitCall).toEqual([30, 1, "leaderboard"]);
   });
 
   test("GET / returns 429 with Retry-After when the limiter blocks the request", async () => {
@@ -596,5 +619,96 @@ describe("GET /api/leaderboard — rate limiting (issue #695)", () => {
     expect(res.status).toBe(429);
     expect(res.body.message).toMatch(/too many requests/i);
     expect(res.headers["retry-after"]).toBe("60");
+  });
+});
+
+describe("GET /api/leaderboard — onlyVerified filter", () => {
+  // Donor A: donations only to verified projects.
+  // Donor B: donations to both verified and unverified projects (must be excluded).
+  const DONOR_A = {
+    public_key: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    display_name: "Donor A",
+    badges: [],
+    total_donated_xlm: "100",
+    projects_supported: 1,
+    impact_score: "70",
+    total_co2_offset_kg: "0",
+  };
+  const DONOR_B = {
+    public_key: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    display_name: "Donor B",
+    badges: [],
+    total_donated_xlm: "200",
+    projects_supported: 2,
+    impact_score: "140",
+    total_co2_offset_kg: "0",
+  };
+
+  beforeEach(resetQueries);
+
+  test("includes SQL that excludes donors with any unverified-project donation", async () => {
+    pool.query.mockResolvedValue({ rows: [DONOR_A] });
+
+    const app = createApp();
+    await request(app).get("/api/leaderboard?onlyVerified=true").expect(200);
+
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).toMatch(/NOT EXISTS/i);
+    expect(sql).toMatch(/verified\s*=\s*false/i);
+    expect(sql).toMatch(/EXISTS/i);
+    expect(sql).toMatch(/verified\s*=\s*true/i);
+    // WHERE must come after all JOINs (including projects)
+    const joinProjectsIdx = sql.search(/LEFT JOIN projects pr\b/i);
+    const whereIdx = sql.search(/\bWHERE\b/i);
+    expect(joinProjectsIdx).toBeGreaterThan(-1);
+    expect(whereIdx).toBeGreaterThan(joinProjectsIdx);
+  });
+
+  test("does not apply verified-only SQL when onlyVerified is omitted", async () => {
+    pool.query.mockResolvedValue({ rows: [DONOR_A, DONOR_B] });
+
+    const app = createApp();
+    await request(app).get("/api/leaderboard").expect(200);
+
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).not.toMatch(/NOT EXISTS/i);
+    expect(sql).not.toMatch(/verified\s*=\s*false/i);
+  });
+
+  test("returns only Donor A when onlyVerified=true (Donor B has unverified donations)", async () => {
+    // DB applies the onlyVerified filter and returns Donor A only.
+    pool.query.mockResolvedValue({ rows: [DONOR_A] });
+
+    const app = createApp();
+    const res = await request(app).get("/api/leaderboard?onlyVerified=true").expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].publicKey).toBe(DONOR_A.public_key);
+    expect(res.body.data[0].displayName).toBe("Donor A");
+    expect(res.body.data.map((e) => e.publicKey)).not.toContain(DONOR_B.public_key);
+  });
+
+  test("returns both donors when onlyVerified is not set", async () => {
+    pool.query.mockResolvedValue({ rows: [DONOR_B, DONOR_A] });
+
+    const app = createApp();
+    const res = await request(app).get("/api/leaderboard").expect(200);
+
+    expect(res.body.data).toHaveLength(2);
+    expect(res.body.data.map((e) => e.publicKey)).toEqual([
+      DONOR_B.public_key,
+      DONOR_A.public_key,
+    ]);
+  });
+
+  test("ignores onlyVerified when the value is not the string true", async () => {
+    pool.query.mockResolvedValue({ rows: [] });
+
+    const app = createApp();
+    await request(app).get("/api/leaderboard?onlyVerified=false").expect(200);
+
+    const [sql] = pool.query.mock.calls[0];
+    expect(sql).not.toMatch(/NOT EXISTS/i);
   });
 });
