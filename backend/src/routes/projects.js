@@ -9,9 +9,11 @@ const { v4: uuid } = require("uuid");
 const QRCode = require("qrcode");
 const pool = require("../db/pool");
 const { logAdminAction } = require("../services/audit");
-const { mapProjectRow, mapProjectMilestoneRow, updateWebhook } = require("../services/store");
+const { mapProjectRow, mapProjectMilestoneRow, updateWebhook, computeBadges } = require("../services/store");
 const {
   getOnChainProject,
+  getProjectDonationEvents,
+  getRegisteredProjectIdFromTransaction,
   CONTRACT_ID,
   server,
   NETWORK_PASSPHRASE,
@@ -19,19 +21,24 @@ const {
 const { enqueueAISummary } = require("../services/summaryQueue");
 const { Contract, TransactionBuilder } = require("@stellar/stellar-sdk");
 const redis = require("../services/redis");
-const { adminRequired } = require("../middleware/auth");
+const { adminRequired, adminTokenRequired } = require("../middleware/auth");
 const { z } = require("zod");
 const { sanitizedStringField } = require("../middleware/validation");
-const { isUrlSafeFromSsrf, assertPublicHttpUrl, SsrfValidationError } = require("../utils/ssrf");
-const WEBHOOK_URL_MAX_LENGTH = 2048;
+const { assertPublicHttpUrl, SsrfValidationError } = require("../utils/ssrf");
 
 const PROJECTS_LIST_CACHE_TTL = 60; // seconds
 const PROJECTS_LIST_CACHE_PREFIX = "projects:list:";
+const PROJECT_DETAIL_CACHE_TTL = 30; // seconds
+const PROJECT_DETAIL_CACHE_PREFIX = "projects:detail:";
 const PROJECT_MILESTONES_CACHE_TTL = 300; // seconds (5 minutes)
 const PROJECT_MILESTONES_CACHE_PREFIX = "projects:milestones:";
 
 function getProjectMilestonesCacheKey(projectId) {
   return PROJECT_MILESTONES_CACHE_PREFIX + projectId;
+}
+
+function getProjectDetailCacheKey(projectId) {
+  return PROJECT_DETAIL_CACHE_PREFIX + projectId;
 }
 
 const VALID_STATUSES = ["active", "completed", "paused"];
@@ -46,7 +53,22 @@ const VALID_CATEGORIES = [
   "Sustainable Agriculture",
   "Other",
 ];
+const VALID_SORT_FIELDS = ["created_at", "raised_xlm", "donor_count"];
 const STELLAR_PUBLIC_KEY_RE = /^G[A-Z0-9]{55}$/;
+const KG_CO2_PER_TREE = 22; // heuristic for treesEquivalent
+
+// USDC → XLM conversion rate used when aggregating campaign progress.
+//
+// Donations can be settled in XLM or USDC. USDC is a USD-pegged stablecoin,
+// while XLM's USD price fluctuates, so operators SHOULD set USDC_TO_XLM_RATE
+// to the current market rate (how many XLM 1 USDC is worth). The default below
+// is a documented fallback only and may under- or over-state campaign progress
+// until the real rate is configured via the environment.
+const DEFAULT_USDC_TO_XLM_RATE = 3;
+function getUsdcToXlmRate() {
+  const parsed = Number.parseFloat(process.env.USDC_TO_XLM_RATE);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_USDC_TO_XLM_RATE;
+}
 
 /**
  * GET /api/projects/featured
@@ -60,6 +82,7 @@ function mapCampaignRow(row) {
   const now = Date.now();
   const goalXLM = Number.parseFloat(row.goal_xlm?.toString() || "0");
   const raisedXLM = Number.parseFloat(row.raised_xlm?.toString() || "0");
+  const raisedUSDC = Number.parseFloat(row.raised_usdc?.toString() || "0");
   const deadlineMs = new Date(row.deadline).getTime();
   const completed = raisedXLM >= goalXLM || now >= deadlineMs;
   const progressPercent =
@@ -72,6 +95,7 @@ function mapCampaignRow(row) {
     description: row.description || "",
     goalXLM: row.goal_xlm?.toString() || "0",
     raisedXLM: raisedXLM.toFixed(7),
+    raisedUSDC: raisedUSDC.toFixed(7),
     deadline: new Date(row.deadline).toISOString(),
     progressPercent,
     completed,
@@ -81,17 +105,28 @@ function mapCampaignRow(row) {
 }
 
 async function fetchCampaignsForProject(projectId) {
+  const usdcToXlmRate = getUsdcToXlmRate();
   const result = await pool.query(
     `SELECT c.*,
             COALESCE(
               SUM(
                 CASE
-                  WHEN d.currency = 'XLM' THEN d.amount_xlm
+                  WHEN d.currency = 'XLM' THEN COALESCE(d.amount_xlm, 0)
+                  WHEN d.currency = 'USDC' THEN COALESCE(d.amount, 0) * $2
                   ELSE 0
                 END
               ),
               0
-            ) AS raised_xlm
+            ) AS raised_xlm,
+            COALESCE(
+              SUM(
+                CASE
+                  WHEN d.currency = 'USDC' THEN COALESCE(d.amount, 0)
+                  ELSE 0
+                END
+              ),
+              0
+            ) AS raised_usdc
      FROM project_campaigns c
      LEFT JOIN donations d
        ON d.project_id = c.project_id
@@ -100,7 +135,7 @@ async function fetchCampaignsForProject(projectId) {
      WHERE c.project_id = $1
      GROUP BY c.id
      ORDER BY c.created_at DESC`,
-    [projectId],
+    [projectId, usdcToXlmRate],
   );
   return result.rows.map(mapCampaignRow);
 }
@@ -191,7 +226,7 @@ router.get("/trending", async (req, res, next) => {
       [limit],
     );
 
-    const data = result.rows.map((row) => ({
+    const data = result.rows.slice(0, limit).map((row) => ({
       ...mapProjectRow(row),
       trendingScore: Number(row.trending_score) || 0,
       donationsLast7Days: Number(row.donations_last_7_days) || 0,
@@ -224,9 +259,12 @@ router.get("/", async (req, res, next) => {
       status,
       verified,
       search,
+      q,
       limit = 20,
       cursor,
+      sort = "created_at",
     } = req.query;
+    const sortField = VALID_SORT_FIELDS.includes(sort) ? sort : "created_at";
     const pageSize = Math.min(Number.parseInt(limit, 10) || 20, 100);
 
     const cacheKey =
@@ -235,7 +273,8 @@ router.get("/", async (req, res, next) => {
         category,
         status,
         verified,
-        search,
+        search: search || q,
+        sort: sortField,
         limit: pageSize,
         cursor: cursor || null,
       });
@@ -258,9 +297,10 @@ router.get("/", async (req, res, next) => {
     if (verified === "true") {
       where.push("verified = true");
     }
-    if (search && typeof search === "string") {
-      values.push(search.trim());
-      where.push(`search_vector @@ websearch_to_tsquery('english', $${values.length})`);
+    const searchTerm = q || search;
+    if (searchTerm && typeof searchTerm === "string") {
+      values.push(searchTerm.trim());
+      where.push(`unaccent(name) ILIKE unaccent('%' || $${values.length} || '%')`);
     }
 
     if (cursor) {
@@ -270,27 +310,28 @@ router.get("/", async (req, res, next) => {
       } catch {
         return res.status(400).json({ error: "Invalid cursor" });
       }
-      const { created_at, id } = cursorData;
-      if (!created_at || !id) {
+      const { id } = cursorData;
+      if (!(sortField in cursorData) || !id) {
         return res.status(400).json({ error: "Invalid cursor" });
       }
-      values.push(created_at, id);
-      const caIdx = values.length - 1;
+      const sortValue = cursorData[sortField];
+      values.push(sortValue, id);
+      const sortValIdx = values.length - 1;
       const idIdx = values.length;
-      where.push(
-        `(created_at < $${caIdx} OR (created_at = $${caIdx} AND id < $${idIdx}))`,
-      );
+      where.push(`(${sortField}, id) < ($${sortValIdx}, $${idIdx})`);
     }
 
     values.push(pageSize + 1);
     const limitIdx = values.length;
 
-    // Build the SQL query: WHERE values are whitelisted enum strings;
-    // all user values use parameterized $N placeholders below.
-    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")} ` : "";
-    const query = `SELECT * FROM projects ${whereClause}ORDER BY created_at DESC, id DESC LIMIT $${limitIdx}`;
+    let query = "SELECT * FROM projects ";
+    if (where.length) {
+      query += "WHERE " + where.join(" AND ") + " ";
+    }
+    query += `ORDER BY ${sortField} DESC, id DESC LIMIT $${limitIdx}`;
 
-    // All user-controlled values (status, category, search, cursor fields) are
+    // Build the SQL query: WHERE values are whitelisted enum strings;
+    // all user-controlled values (status, category, search, cursor fields) are
     // passed as parameterised $N placeholders in `values`. Dynamic WHERE clauses
     // are built only from whitelisted enum strings, so no injection surface exists.
     // eslint-disable-next-line sql-injection/no-sql-injection
@@ -303,7 +344,7 @@ router.get("/", async (req, res, next) => {
     if (hasMore) {
       const last = rows[pageSize - 1];
       nextCursor = Buffer.from(
-        JSON.stringify({ created_at: last.created_at, id: last.id }),
+        JSON.stringify({ [sortField]: last[sortField], id: last.id }),
       ).toString("base64");
     }
 
@@ -415,6 +456,37 @@ router.post("/", async (req, res, next) => {
 });
 
 /**
+ * GET /api/projects/:id/donors
+ * Returns each donor address once for a project.
+ */
+router.get("/:id/donors", async (req, res, next) => {
+  try {
+    const projectResult = await pool.query(
+      "SELECT id FROM projects WHERE id = $1",
+      [req.params.id],
+    );
+    if (!projectResult.rows[0]) {
+      return res.status(404).json({ success: false, error: "Project not found" });
+    }
+
+    const result = await pool.query(
+      `SELECT DISTINCT donor_address
+         FROM donations
+        WHERE project_id = $1
+        ORDER BY donor_address ASC`,
+      [req.params.id],
+    );
+
+    res.json({
+      success: true,
+      data: result.rows.map((row) => row.donor_address),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/**
  * GET /api/projects/:id/verify
  * Reads the project record directly from the Soroban contract.
  */
@@ -462,8 +534,10 @@ router.get("/:id/verify", async (req, res) => {
       },
     });
   } catch (err) {
-    res.json({
-      success: true,
+    console.error(`[verify] Error checking on-chain status for project ${req.params.id}:`, err);
+    res.status(500).json({
+      success: false,
+      error: "Failed to verify on-chain status",
       data: {
         projectId: req.params.id,
         onChainVerified: false,
@@ -471,6 +545,49 @@ router.get("/:id/verify", async (req, res) => {
         totalRaisedOnChain: "0.0000000",
       },
     });
+  }
+});
+
+/**
+ * GET /api/projects/:id/on-chain-donations
+ * Returns decoded on-chain donation events for a project, fetched from
+ * Stellar Horizon via getProjectDonationEvents.
+ */
+router.get("/:id/on-chain-donations", async (req, res, next) => {
+  try {
+    const projectId = req.params.id;
+    const { limit = 20, cursor } = req.query;
+    const pageSize = Math.min(Number.parseInt(limit, 10) || 20, 100);
+
+    const projectResult = await pool.query("SELECT id FROM projects WHERE id = $1", [projectId]);
+    if (!projectResult.rows[0]) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    const events = await getProjectDonationEvents(projectId, { limit: pageSize, cursor });
+    const hasMore = events.length >= pageSize;
+    const data = events.map(({ donor, amount, ledger, badge, msgHash }) => ({
+      donor,
+      amount,
+      ledger,
+      badge,
+      msgHash,
+    }));
+
+    let nextCursor = null;
+    if (events.length > 0) {
+      nextCursor = events[events.length - 1].pagingToken || null;
+    }
+
+    res.json({
+      success: true,
+      data,
+      next_cursor: nextCursor,
+      nextCursor: nextCursor,
+      has_more: Boolean(hasMore && nextCursor),
+    });
+  } catch (e) {
+    next(e);
   }
 });
 
@@ -563,6 +680,11 @@ router.post("/:id/campaigns", async (req, res, next) => {
 
 /**
  * List campaigns linked to a project.
+ *
+ * Each campaign's `raisedXLM` is the total raised in XLM-equivalent units and
+ * now INCLUDES USDC donations converted at the configured USDC_TO_XLM_RATE
+ * (see getUsdcToXlmRate). `raisedUSDC` is the raw, unconverted USDC total so
+ * clients can display the breakdown. Both feed `progressPercent`/`completed`.
  *
  * @route GET /api/projects/:id/campaigns
  * @param {import('express').Request} req - Express request containing the project id.
@@ -742,7 +864,7 @@ router.get("/admin/pending", async (req, res, next) => {
  * Builds a Soroban transaction to register a project on-chain.
  * Returns the XDR for the admin to sign.
  */
-router.post("/admin/register", adminRequired, async (req, res) => {
+router.post("/admin/register", adminTokenRequired, async (req, res) => {
   try {
     const { projectId, name, wallet, co2PerXLM, adminAddress } = req.body;
 
@@ -787,13 +909,39 @@ router.post("/admin/register", adminRequired, async (req, res) => {
 /**
  * POST /api/projects/admin/confirm
  * Verifies a registration transaction and updates the local store.
+ *
+ * Security: the transaction is read from Horizon and parsed on the server
+ * (never trusted from the request body) so a caller cannot mark an arbitrary
+ * project as verified by replaying a registration transaction hash that
+ * belongs to a different project.
  */
-router.post("/admin/confirm", adminRequired, async (req, res) => {
+router.post("/admin/confirm", adminTokenRequired, async (req, res) => {
   try {
     const { transactionHash, projectId } = req.body;
 
+    if (!transactionHash || typeof transactionHash !== "string") {
+      return res
+        .status(400)
+        .json({ success: false, error: "transactionHash is required" });
+    }
+    if (!projectId || typeof projectId !== "string") {
+      return res
+        .status(400)
+        .json({ success: false, error: "projectId is required" });
+    }
+
     const tx = await server.getTransaction(transactionHash);
     if (!tx.successful) throw new Error("Transaction failed");
+
+    // Confirm the transaction actually registered this project on-chain
+    // before updating the local store.
+    const registeredProjectId = getRegisteredProjectIdFromTransaction(tx);
+    if (registeredProjectId !== projectId) {
+      return res.status(400).json({
+        success: false,
+        error: "Transaction does not register the requested project",
+      });
+    }
 
     const result = await pool.query(
       `UPDATE projects
@@ -862,6 +1010,7 @@ router.patch("/:id", async (req, res, next) => {
     );
 
     if (typeof redis.deletePattern === "function") await redis.deletePattern(PROJECTS_LIST_CACHE_PREFIX + "*");
+    if (typeof redis.deletePattern === "function") await redis.deletePattern(getProjectDetailCacheKey(req.params.id));
 
     res.json({ success: true, data: mapProjectRow(result.rows[0]) });
   } catch (e) {
@@ -871,21 +1020,27 @@ router.patch("/:id", async (req, res, next) => {
 
 router.get("/:id", async (req, res, next) => {
   try {
-    const projectResult = await pool.query(
-      `SELECT p.*, COUNT(pf.id)::int AS follow_count
-       FROM projects p
-       LEFT JOIN project_follows pf ON pf.project_id = p.id
-       WHERE p.id = $1
-       GROUP BY p.id`,
-      [req.params.id],
-    );
-    if (!projectResult.rows[0])
-      return res.status(404).json({ error: "Project not found" });
-
     const { walletAddress } = req.query;
     const hasWalletQuery =
       typeof walletAddress === "string" && walletAddress.trim().length > 0;
     const normalizedWallet = hasWalletQuery ? walletAddress.trim() : null;
+
+    // Non-personalized requests can use the Redis detail cache.
+    if (!hasWalletQuery) {
+      const cacheKey = getProjectDetailCacheKey(req.params.id);
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        res.set("Cache-Control", `public, max-age=${PROJECT_DETAIL_CACHE_TTL}`);
+        return res.json(cached);
+      }
+    }
+
+    const projectResult = await pool.query(
+      "SELECT * FROM projects WHERE id = $1",
+      [req.params.id],
+    );
+    if (!projectResult.rows[0])
+      return res.status(404).json({ error: "Project not found" });
 
     const updatedAt = projectResult.rows[0].updated_at;
     const etag = `"${crypto.createHash("md5").update(String(updatedAt)).digest("hex")}"`;
@@ -968,7 +1123,7 @@ router.get("/:id", async (req, res, next) => {
       return `${negative ? "-" : ""}${whole.toString()}.${fracStr}`;
     };
 
-    res.json({
+    const responseBody = {
       success: true,
       data: {
         ...mapProjectRow(projectResult.rows[0]),
@@ -989,7 +1144,14 @@ router.get("/:id", async (req, res, next) => {
         followCount,
         isFollowing,
       },
-    });
+    };
+
+    if (!hasWalletQuery) {
+      const cacheKey = getProjectDetailCacheKey(req.params.id);
+      await redis.set(cacheKey, responseBody, PROJECT_DETAIL_CACHE_TTL);
+    }
+
+    res.json(responseBody);
   } catch (e) {
     next(e);
   }
@@ -1201,8 +1363,21 @@ router.get("/:id/summary-status", async (req, res, next) => {
       });
     }
 
+    const jobResult = await pool.query(
+      "SELECT state FROM pgboss.job WHERE name = 'ai-summary' AND data->>'projectId' = $1 ORDER BY created_on DESC LIMIT 1",
+      [req.params.id]
+    );
+
+    let status = "queued";
+    if (jobResult.rows.length > 0) {
+      const state = jobResult.rows[0].state;
+      if (state === "failed" || state === "cancelled") {
+        status = "failed";
+      }
+    }
+
     res.json({
-      status: "queued",
+      status,
       aiSummary: null,
       aiSummaryGeneratedAt: null,
       aiSummaryModel: null,
@@ -1342,59 +1517,6 @@ router.get("/:id/matching", async (req, res, next) => {
 });
 
 /**
- * PATCH /api/projects/:id
- * Update mutable project fields. Currently supports `webhook_url`, which is
- * validated to prevent SSRF: it must be HTTPS, must not resolve to a
- * private/loopback/link-local address, and must be a reasonable length.
- */
-router.patch("/:id", async (req, res, next) => {
-  try {
-    const { webhook_url: webhookUrl } = req.body || {};
-
-    if (webhookUrl === undefined) {
-      return res.status(400).json({ error: "No updatable fields provided" });
-    }
-
-    if (webhookUrl !== null) {
-      if (typeof webhookUrl !== "string" || !webhookUrl.startsWith("https://")) {
-        return res.status(400).json({ error: "webhook_url must be a valid https:// URL" });
-      }
-
-      if (webhookUrl.length > WEBHOOK_URL_MAX_LENGTH) {
-        return res
-          .status(400)
-          .json({ error: `webhook_url must be at most ${WEBHOOK_URL_MAX_LENGTH} characters` });
-      }
-
-      const safe = await isUrlSafeFromSsrf(webhookUrl);
-      if (!safe) {
-        return res
-          .status(400)
-          .json({ error: "webhook_url must not resolve to a private, loopback, or link-local address" });
-      }
-    }
-
-    const projectResult = await pool.query("SELECT id FROM projects WHERE id = $1", [req.params.id]);
-    if (!projectResult.rows[0]) {
-      return res.status(404).json({ error: "Project not found" });
-    }
-
-    const result = await pool.query(
-      `UPDATE projects
-       SET webhook_url = $1,
-           updated_at = NOW()
-       WHERE id = $2
-       RETURNING *`,
-      [webhookUrl, req.params.id],
-    );
-
-    res.json({ success: true, data: mapProjectRow(result.rows[0]) });
-  } catch (e) {
-    next(e);
-  }
-});
-
-/**
  * PATCH /api/projects/:id/status
  * Approve or reject a project. Body: { status: "active" | "rejected", reason?: string }
  * `adminAddress` must match the project wallet (owner) or be a platform admin.
@@ -1448,8 +1570,189 @@ router.patch("/:id/status", async (req, res, next) => {
 
     if (typeof redis.deletePattern === "function") await redis.deletePattern(PROJECTS_LIST_CACHE_PREFIX + "*");
     if (typeof redis.deletePattern === "function") await redis.deletePattern("stats:*");
+    if (typeof redis.deletePattern === "function") await redis.deletePattern(getProjectDetailCacheKey(req.params.id));
+    featuredCache = null;
 
     res.json({ success: true, data: mapProjectRow(result.rows[0]) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// ── Impact certificate ─────────────────────────────────────────────────────
+
+/**
+ * GET /api/projects/:id/impact-certificate?donorAddress=G...
+ *
+ * Returns a personalised impact certificate for a specific donor on a specific
+ * project. Includes:
+ *   - Donor name (from their profile, if set)
+ *   - Total XLM donated to this project
+ *   - Total CO₂ offset in kg (proportional to the project's overall offset)
+ *   - Trees equivalent
+ *   - Badge tier (bronze / silver / gold / platinum)
+ *   - Project name, category, and verification status
+ *   - QR code (base64 data-URL) linking to the most recent on-chain donation
+ *   - Full donation history for this donor on this project
+ *
+ * Query params:
+ *   donorAddress  (required) — Stellar G… public key of the donor
+ *
+ * Response 200:
+ * {
+ *   success: true,
+ *   data: {
+ *     projectId: string,
+ *     projectName: string,
+ *     projectCategory: string,
+ *     projectVerified: boolean,
+ *     donorAddress: string,
+ *     donorName: string | null,
+ *     totalDonatedXLM: string,      // 7-decimal string
+ *     co2OffsetKg: number,
+ *     treesEquivalent: number,
+ *     badgeTier: "bronze"|"silver"|"gold"|"platinum"|null,
+ *     donationCount: number,
+ *     donations: Array<{
+ *       id, amountXLM, message, transactionHash, createdAt
+ *     }>,
+ *     qrCode: string,               // data:image/png;base64,... for the on-chain record URL
+ *     issuedAt: string              // ISO timestamp
+ *   }
+ * }
+ *
+ * Errors: 400 (missing/invalid donorAddress), 404 (project or donor not found)
+ */
+
+const KG_CO2_PER_TREE_CERT = 21.77; // consistent with impact.js
+
+/** Derive a badge tier from the donor's total XLM donated to this project. */
+function deriveBadgeTier(totalXLM) {
+  if (totalXLM >= 10000) return "platinum";
+  if (totalXLM >= 1000) return "gold";
+  if (totalXLM >= 100) return "silver";
+  if (totalXLM > 0) return "bronze";
+  return null;
+}
+
+/**
+ * Build the URL to the on-chain donation record on Stellar Explorer.
+ * Falls back to the Horizon testnet explorer.
+ */
+function buildOnChainUrl(transactionHash) {
+  const network = process.env.STELLAR_NETWORK || "testnet";
+  if (network === "mainnet" || network === "public") {
+    return `https://stellar.expert/explorer/public/tx/${transactionHash}`;
+  }
+  return `https://stellar.expert/explorer/testnet/tx/${transactionHash}`;
+}
+
+router.get("/:id/impact-certificate", async (req, res, next) => {
+  try {
+    const { donorAddress } = req.query;
+
+    // Validate donorAddress — must be a 56-char Stellar G-address
+    if (
+      !donorAddress ||
+      typeof donorAddress !== "string" ||
+      !/^G[A-Z2-7]{55}$/.test(donorAddress)
+    ) {
+      return res.status(400).json({
+        error: "donorAddress query parameter is required and must be a valid Stellar public key",
+      });
+    }
+
+    // 1. Fetch project — includes category and verification status
+    const projectResult = await pool.query(
+      `SELECT id, name, category, verified, on_chain_verified, raised_xlm, co2_offset_kg
+       FROM projects
+       WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!projectResult.rows[0]) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    // 2. Fetch donor's profile (display name) — may not exist
+    const profileResult = await pool.query(
+      "SELECT display_name FROM profiles WHERE public_key = $1",
+      [donorAddress],
+    );
+
+    // 3. Fetch all XLM donations by this donor for this project
+    const donationsResult = await pool.query(
+      `SELECT
+         id,
+         COALESCE(amount_xlm, amount) AS amount_xlm,
+         message,
+         transaction_hash,
+         created_at
+       FROM donations
+       WHERE project_id = $1
+         AND donor_address = $2
+         AND (currency = 'XLM' OR currency IS NULL)
+       ORDER BY created_at DESC`,
+      [req.params.id, donorAddress],
+    );
+
+    if (donationsResult.rows.length === 0) {
+      return res.status(404).json({
+        error: "No donations found for this donor on this project",
+      });
+    }
+
+    // 4. Compute aggregate stats
+    const project = projectResult.rows[0];
+    const raisedXlm = Number.parseFloat(project.raised_xlm?.toString() || "0");
+    const projectCo2Kg = Number.parseFloat(project.co2_offset_kg?.toString() || "0");
+    const kgPerXlm = raisedXlm > 0 ? projectCo2Kg / raisedXlm : 0;
+
+    const totalDonatedXLM = donationsResult.rows.reduce(
+      (sum, row) => sum + Number.parseFloat(row.amount_xlm?.toString() || "0"),
+      0,
+    );
+    const co2OffsetKg = Math.round(totalDonatedXLM * kgPerXlm);
+    const treesEquivalent =
+      co2OffsetKg > 0
+        ? Number((co2OffsetKg / KG_CO2_PER_TREE_CERT).toFixed(2))
+        : 0;
+
+    const donations = donationsResult.rows.map((row) => ({
+      id: row.id,
+      amountXLM: Number.parseFloat(row.amount_xlm?.toString() || "0").toFixed(7),
+      message: row.message || null,
+      transactionHash: row.transaction_hash,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+
+    // 5. Generate QR code linking to the most recent on-chain donation record
+    const latestTxHash = donationsResult.rows[0].transaction_hash;
+    const onChainUrl = buildOnChainUrl(latestTxHash);
+    const qrCode = await QRCode.toDataURL(onChainUrl, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 256,
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        projectId: project.id,
+        projectName: project.name,
+        projectCategory: project.category,
+        projectVerified: Boolean(project.verified) || Boolean(project.on_chain_verified),
+        donorAddress,
+        donorName: profileResult.rows[0]?.display_name || null,
+        totalDonatedXLM: totalDonatedXLM.toFixed(7),
+        co2OffsetKg,
+        treesEquivalent,
+        badgeTier: deriveBadgeTier(totalDonatedXLM),
+        donationCount: donations.length,
+        donations,
+        qrCode,
+        issuedAt: new Date().toISOString(),
+      },
+    });
   } catch (e) {
     next(e);
   }
@@ -1529,6 +1832,73 @@ router.post("/:id/webhook", async (req, res, next) => {
 });
 
 /**
+ * GET /api/projects/:id/social-card
+ * Returns a shareable impact summary card as JSON.
+ * Requires ?donorAddress=G...&amount=X query params.
+ */
+router.get("/:id/social-card", async (req, res, next) => {
+  try {
+    const { donorAddress, amount } = req.query;
+
+    if (!donorAddress || typeof donorAddress !== "string" || !STELLAR_PUBLIC_KEY_RE.test(donorAddress)) {
+      return res.status(400).json({ error: "donorAddress must be a valid Stellar public key" });
+    }
+    const donationAmount = Number.parseFloat(amount);
+    if (!amount || !Number.isFinite(donationAmount) || donationAmount <= 0) {
+      return res.status(400).json({ error: "amount must be a positive number" });
+    }
+
+    const projectResult = await pool.query(
+      "SELECT name, co2_offset_kg, raised_xlm FROM projects WHERE id = $1",
+      [req.params.id],
+    );
+    if (!projectResult.rows[0]) {
+      return res.status(404).json({ error: "Project not found" });
+    }
+
+    const project = projectResult.rows[0];
+    const projectCo2OffsetKg = Number.parseFloat(project.co2_offset_kg?.toString() || "0");
+    const raisedXlm = Number.parseFloat(project.raised_xlm?.toString() || "0");
+
+    // Calculate CO2 offset proportionally
+    const kgPerXlm = raisedXlm > 0 ? projectCo2OffsetKg / raisedXlm : 0;
+    const co2OffsetKg = Math.round(donationAmount * kgPerXlm);
+    const treesEquivalent = co2OffsetKg > 0 ? (co2OffsetKg / KG_CO2_PER_TREE).toFixed(1) : "0";
+
+    // Determine badge tier for this donation amount
+    const badges = computeBadges(donationAmount);
+    const badge = badges.length > 0 ? badges[0] : null;
+    const BADGE_EMOJIS = { seedling: "🌱", tree: "🌳", forest: "🌲", earth: "🌍" };
+    const BADGE_LABELS = { seedling: "Seedling", tree: "Tree", forest: "Forest", earth: "Earth Guardian" };
+
+    const badgeEmoji = badge ? (BADGE_EMOJIS[badge.tier] || "🌟") : "🌟";
+    const badgeLabel = badge ? (BADGE_LABELS[badge.tier] || badge.tier) : "Supporter";
+
+    const socialText = [
+      `🌍 I donated ${donationAmount} XLM to ${project.name} on Stellar GreenPay`,
+      `💚 Offsetting ~${co2OffsetKg.toLocaleString()} kg CO₂ — equivalent to planting ${treesEquivalent} trees`,
+      `🏆 My badge: ${badgeLabel} ${badgeEmoji}`,
+    ].join("\n");
+
+    res.json({
+      success: true,
+      data: {
+        text: socialText,
+        projectName: project.name,
+        amount: donationAmount.toFixed(7),
+        co2OffsetKg,
+        treesEquivalent: Number.parseFloat(treesEquivalent),
+        badgeTier: badge ? badge.tier : null,
+        badgeEmoji,
+        badgeLabel,
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/**
  * GET /api/projects/:id/badge-holders
  * Returns the community of badge-holding donors for each project.
  */
@@ -1570,21 +1940,26 @@ router.get("/:id/badge-holders", async (req, res, next) => {
   }
 });
 
+const WEBHOOK_SECRET_MIN_LENGTH = 32;
+const WEBHOOK_URL_RE = /^https:\/\/[^\s]{2,}$/i;
+
 /**
  * PATCH /api/projects/:id/webhook
- * Update the webhook URL and secret for a project. Auto-generates a secret
- * when one is not provided. Returns the updated webhook config.
+ * Set or clear the webhook URL and secret for milestone notifications.
+ * Requires the project's wallet_address as the Bearer token subject so that
+ * only the project owner (not any admin) can configure this.
+ *
+ * Body:
+ *   webhookUrl    {string|null}  — https:// URL to deliver milestone events to.
+ *   webhookSecret {string|null}  — HMAC-SHA256 signing secret (≥ 32 chars).
+ *
+ * Pass null / omit both to clear the existing webhook configuration.
  */
-router.patch("/:id/webhook", async (req, res, next) => {
+router.patch("/:id/webhook", adminTokenRequired, async (req, res, next) => {
   try {
-    const { webhookUrl, webhookSecret } = req.body || {};
-
-    if (webhookUrl !== null && webhookUrl !== undefined && webhookUrl !== "") {
-      try {
-        new URL(webhookUrl);
-      } catch {
-        return res.status(400).json({ error: "Invalid webhook URL" });
-      }
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(req.params.id)) {
+      return res.status(404).json({ error: "Project not found" });
     }
 
     const projectResult = await pool.query(
@@ -1595,79 +1970,56 @@ router.patch("/:id/webhook", async (req, res, next) => {
       return res.status(404).json({ error: "Project not found" });
     }
 
-    const url = webhookUrl || null;
-    let secret = webhookSecret || null;
-    if (url && !secret) {
-      secret = crypto.randomBytes(32).toString("hex");
+    const { webhookUrl, webhookSecret } = req.body || {};
+
+    // Allow clearing the webhook by passing null / empty values for both fields.
+    const clearing = (webhookUrl == null || webhookUrl === "") &&
+                     (webhookSecret == null || webhookSecret === "");
+
+    if (!clearing) {
+      if (typeof webhookUrl !== "string" || !WEBHOOK_URL_RE.test(webhookUrl)) {
+        return res.status(400).json({
+          error: "webhookUrl must be a valid https:// URL",
+        });
+      }
+      if (typeof webhookSecret !== "string" ||
+          webhookSecret.length < WEBHOOK_SECRET_MIN_LENGTH) {
+        return res.status(400).json({
+          error: `webhookSecret must be at least ${WEBHOOK_SECRET_MIN_LENGTH} characters`,
+        });
+      }
     }
 
-    const updated = await updateWebhook(req.params.id, url, secret);
-    res.json({ success: true, data: updated });
-  } catch (e) {
-    next(e);
-  }
-});
-
-/**
- * POST /api/projects/:id/webhook/test
- * Sends a test event to the project's configured webhook URL.
- * Returns the HTTP status code from the remote endpoint.
- */
-router.post("/:id/webhook/test", async (req, res, next) => {
-  try {
-    const projectResult = await pool.query(
-      "SELECT id, webhook_url, webhook_secret FROM projects WHERE id = $1",
-      [req.params.id],
+    const result = await pool.query(
+      `UPDATE projects
+          SET webhook_url    = $1,
+              webhook_secret = $2,
+              updated_at     = NOW()
+        WHERE id = $3
+        RETURNING id, webhook_url`,
+      [
+        clearing ? null : webhookUrl.trim(),
+        clearing ? null : webhookSecret,
+        req.params.id,
+      ],
     );
-    const project = projectResult.rows[0];
-    if (!project) {
-      return res.status(404).json({ error: "Project not found" });
-    }
-    if (!project.webhook_url || !project.webhook_secret) {
-      return res.status(400).json({ error: "No webhook configured for this project" });
-    }
 
-    const payload = {
-      event: "webhook.test",
-      projectId: req.params.id,
-      message: "This is a test webhook delivery from GreenPay.",
-      timestamp: new Date().toISOString(),
-    };
-
-    const body = JSON.stringify(payload);
-    const urlObj = new URL(project.webhook_url);
-    const lib = urlObj.protocol === "https:" ? require("https") : require("http");
-
-    const statusCode = await new Promise((resolve, reject) => {
-      const options = {
-        hostname: urlObj.hostname,
-        port: urlObj.port || (urlObj.protocol === "https:" ? 443 : 80),
-        path: urlObj.pathname + urlObj.search,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
-          "User-Agent": "GreenPay-Webhook/1.0",
-        },
-        timeout: 10000,
-      };
-
-      const req = lib.request(options, (response) => {
-        response.on("data", () => {});
-        response.on("end", () => resolve(response.statusCode));
-      });
-
-      req.on("error", (err) => reject(err));
-      req.on("timeout", () => {
-        req.destroy();
-        reject(new Error("Request timed out"));
-      });
-
-      req.write(body);
-      req.end();
+    logAdminAction({
+      actor: (req.admin && req.admin.sub) || "admin",
+      action: clearing ? "project.webhook.cleared" : "project.webhook.updated",
+      targetType: "project",
+      targetId: req.params.id,
+      metadata: { webhookUrl: clearing ? null : webhookUrl.trim() },
+      ipAddress: req.ip,
     });
 
-    res.json({ success: true, statusCode });
+    res.json({
+      success: true,
+      data: {
+        id: result.rows[0].id,
+        webhookUrl: result.rows[0].webhook_url || null,
+      },
+    });
   } catch (e) {
     next(e);
   }
@@ -1678,4 +2030,6 @@ module.exports = router;
 // Export internal functions for testing
 if (process.env.NODE_ENV === "test") {
   module.exports.mapCampaignRow = mapCampaignRow;
+  module.exports.getUsdcToXlmRate = getUsdcToXlmRate;
+  module.exports.fetchCampaignsForProject = fetchCampaignsForProject;
 }

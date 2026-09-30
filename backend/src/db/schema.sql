@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS projects (
   raised_xlm NUMERIC(20, 7) NOT NULL DEFAULT 0,
   donor_count INTEGER NOT NULL DEFAULT 0,
   co2_offset_kg INTEGER NOT NULL DEFAULT 0,
+  co2_per_xlm NUMERIC(20, 7) NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'active',
   verified BOOLEAN NOT NULL DEFAULT FALSE,
   on_chain_verified BOOLEAN NOT NULL DEFAULT FALSE,
@@ -35,11 +36,13 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS ai_summary_source_hash  TEXT;
 -- signed POSTs when donation milestones are reached.
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS webhook_url    TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS webhook_secret TEXT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS previous_webhook_secret TEXT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS webhook_secret_rotated_at TIMESTAMPTZ;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS previous_webhook_secret_expires_at TIMESTAMPTZ;
 
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS image_url TEXT;
 
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS webhook_url    TEXT;
-ALTER TABLE projects ADD COLUMN IF NOT EXISTS webhook_secret TEXT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS rejection_reason TEXT;
 
 -- donations: immutable donation ledger. Each row is a single
 -- contribution from donor_address to a project. transaction_hash must be
@@ -66,6 +69,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   public_key TEXT PRIMARY KEY,
   display_name TEXT,
   bio TEXT,
+  avatar_url TEXT,
   total_donated_xlm NUMERIC(20, 7) NOT NULL DEFAULT 0,
   projects_supported INTEGER NOT NULL DEFAULT 0,
   badges JSONB NOT NULL DEFAULT '[]'::JSONB,
@@ -84,6 +88,52 @@ CREATE TABLE IF NOT EXISTS project_updates (
   image_url TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- update_images: content-moderation audit log + admin review queue for images
+-- attached to project updates (issue #1101, migration
+-- 008_update_images_moderation.js). One row per AWS Rekognition
+-- DetectModerationLabels verdict. update_id/project_id are nullable because an
+-- image is scanned when it reaches storage, i.e. before any update references
+-- it. max_confidence is a percentage (0–100), matching Rekognition's units.
+-- moderation_labels holds the normalised label summary as JSONB.
+CREATE TABLE IF NOT EXISTS update_images (
+  id UUID PRIMARY KEY,
+  update_id UUID REFERENCES project_updates(id) ON DELETE CASCADE,
+  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+  storage_key TEXT,
+  image_url TEXT NOT NULL,
+  storage_backend TEXT NOT NULL DEFAULT 's3',
+  status TEXT NOT NULL DEFAULT 'pending_review',
+  flagged_for_review BOOLEAN NOT NULL DEFAULT FALSE,
+  provider TEXT NOT NULL DEFAULT 'aws_rekognition',
+  max_confidence NUMERIC(5, 2),
+  moderation_labels JSONB NOT NULL DEFAULT '[]'::JSONB,
+  reason TEXT,
+  reviewed_by TEXT,
+  reviewed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT update_images_status_check
+    CHECK (status IN ('approved', 'rejected', 'pending_review')),
+  CONSTRAINT update_images_max_confidence_range
+    CHECK (
+      max_confidence IS NULL
+      OR (max_confidence >= 0 AND max_confidence <= 100)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_update_images_storage_key
+  ON update_images (storage_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_update_images_image_url
+  ON update_images (image_url, created_at DESC);
+-- Admin review queue: unreviewed rows, newest first.
+CREATE INDEX IF NOT EXISTS idx_update_images_pending_review
+  ON update_images (created_at DESC)
+  WHERE status = 'pending_review';
+CREATE INDEX IF NOT EXISTS idx_update_images_update_id
+  ON update_images (update_id);
+CREATE INDEX IF NOT EXISTS idx_update_images_project_created
+  ON update_images (project_id, created_at DESC);
 
 -- project_subscriptions: email-based subscriptions to project updates.
 -- UNIQUE(project_id, email) prevents duplicate sign-ups.
@@ -201,8 +251,12 @@ CREATE TABLE IF NOT EXISTS device_tokens (
   platform TEXT NOT NULL,
   wallet_address TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_delivered_at TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_device_tokens_last_delivered
+  ON device_tokens (last_delivered_at)
+  WHERE last_delivered_at IS NULL;
 
 -- recurring_donations: recurring donation schedules set by donors.
 -- next_due_date is calculated from the schedule when the donation is created
@@ -275,6 +329,33 @@ CREATE INDEX IF NOT EXISTS verification_requests_status_idx
 CREATE INDEX IF NOT EXISTS verification_requests_wallet_idx
   ON verification_requests (wallet_address);
 
+-- webhook_deliveries: history of outbound webhook delivery attempts.
+-- Populated when milestone.reached (and similar) events are sent to a
+-- project's webhook_url. Used by GET /api/webhooks/:projectId/history.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id UUID PRIMARY KEY,
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  event TEXT,
+  payload_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'delivered', 'failed')),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  last_attempt_at TIMESTAMPTZ,
+  next_attempt_at TIMESTAMPTZ,
+  response_status INTEGER,
+  delivered_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status
+  ON webhook_deliveries (status);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_project_id
+  ON webhook_deliveries (project_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_project_created
+  ON webhook_deliveries (project_id, created_at DESC);
+
 -- global_stats_mv: pre-aggregated landing-page totals refreshed by pg-boss.
 CREATE MATERIALIZED VIEW IF NOT EXISTS global_stats_mv AS
 SELECT
@@ -286,3 +367,15 @@ SELECT
   (SELECT COUNT(*)::int FROM donations) AS total_donations
 FROM projects;
 CREATE UNIQUE INDEX IF NOT EXISTS global_stats_mv_id_uidx ON global_stats_mv (id);
+
+-- dead_letter: failed background jobs that have exhausted all retries
+CREATE TABLE IF NOT EXISTS dead_letter (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  queue_name TEXT NOT NULL,
+  job_id TEXT,
+  payload JSONB,
+  error TEXT,
+  failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_name ON dead_letter (queue_name);
+CREATE INDEX IF NOT EXISTS idx_dead_letter_failed_at ON dead_letter (failed_at DESC);

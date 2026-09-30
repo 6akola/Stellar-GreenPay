@@ -11,18 +11,24 @@
     "storage",
     "activeTab",
     "scripting",
-    "contextMenus"
+    "contextMenus",
+    "alarms"
   ],
+  "permissions": ["storage", "activeTab", "scripting", "contextMenus"],
   "background": {
-    "service_worker": "dist/background.js"
+    "service_worker": "dist/background.js",
+    "type": "module"
   },
   "host_permissions": [
-    "https://app.greenpay.io/*",
-    "https://testnet.greenpay.io/*"
+    "https://api.stellar-greenpay.app/*",
+    "https://horizon.stellar.org/*",
+    "https://horizon-testnet.stellar.org/*"
+    "https://greenpay.app/*",
+    "https://staging.greenpay.app/*"
   ],
   "content_scripts": [
     {
-      "matches": ["https://app.greenpay.io/*", "https://testnet.greenpay.io/*"],
+      "matches": ["https://greenpay.app/*", "https://staging.greenpay.app/*"],
       "js": ["dist/content-script.js"],
       "run_at": "document_end"
     }
