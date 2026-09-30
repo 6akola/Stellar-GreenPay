@@ -18,26 +18,18 @@ interface AdminProps {
   onConnect: (pk: string) => void;
 }
 
-function weekKey(dateStr: string): string {
-  const d = new Date(dateStr);
-  if (Number.isNaN(d.getTime())) return dateStr;
-  // ISO week-like key (YYYY-WW) using UTC week start (Mon)
-  const utc = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  const day = utc.getUTCDay() || 7;
-  utc.setUTCDate(utc.getUTCDate() + 4 - day);
-  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1));
-  const weekNo = Math.ceil((((utc.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
-  return `${utc.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`;
-}
-
 export default function ProjectAdmin({ publicKey, onConnect }: AdminProps) {
   const router = useRouter();
   const { projectId } = router.query;
 
   const [project, setProject] = useState<ClimateProject | null>(null);
   const [donations, setDonations] = useState<Donation[]>([]);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // `loading` is derived by comparing the in-flight request to the last one
+  // that resolved, rather than toggled synchronously inside the effect
+  // (which triggers a cascading render).
+  const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
+  const loading = loadedProjectId !== projectId;
 
   const [updateTitle, setUpdateTitle] = useState("");
   const [updateBody, setUpdateBody] = useState("");
@@ -149,8 +141,6 @@ export default function ProjectAdmin({ publicKey, onConnect }: AdminProps) {
 
   useEffect(() => {
     if (!projectId || typeof projectId !== "string") return;
-    setLoading(true);
-    setError(null);
 
     Promise.all([
       fetchProject(projectId),
@@ -165,9 +155,10 @@ export default function ProjectAdmin({ publicKey, onConnect }: AdminProps) {
         setMatches(mt);
         setWebhookUrl(p.webhookUrl || "");
         setWebhookSecret(p.webhookSecret || "");
+        setError(null);
       })
       .catch((e: unknown) => setError((e as Error).message || "Failed to load project"))
-      .finally(() => setLoading(false));
+      .finally(() => setLoadedProjectId(projectId));
   }, [projectId]);
 
   const isOwner = !!publicKey && !!project && publicKey === project.walletAddress;
@@ -183,18 +174,6 @@ export default function ProjectAdmin({ publicKey, onConnect }: AdminProps) {
       byDonor.set(donorAddress, curr);
     }
     return Array.from(byDonor.values()).sort((a, b) => b.total - a.total);
-  }, [donations]);
-
-  const weeklyGrowth = useMemo(() => {
-    const byWeek = new Map<string, number>();
-    for (const d of donations) {
-      const key = weekKey(d.createdAt);
-      const amount = parseFloat(d.amountXLM || d.amount || "0");
-      byWeek.set(key, (byWeek.get(key) || 0) + (Number.isFinite(amount) ? amount : 0));
-    }
-    return Array.from(byWeek.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([week, totalXLM]) => ({ week, totalXLM: Number(totalXLM.toFixed(2)) }));
   }, [donations]);
 
   const downloadCsv = () => {
@@ -469,6 +448,7 @@ export default function ProjectAdmin({ publicKey, onConnect }: AdminProps) {
         </div>
         {imageUploadError ? <p className="mb-3 text-sm text-red-600">{imageUploadError}</p> : null}
         {project.imageUrl ? (
+          /* eslint-disable-next-line @next/next/no-img-element */
           <img src={project.imageUrl} alt={`${project.name} banner`} className="h-48 w-full rounded-2xl object-cover" />
         ) : (
           <div className="flex h-48 items-center justify-center rounded-2xl border border-dashed border-forest-200 bg-forest-50 text-sm text-[#5a7a5a]">No banner image yet. Upload one to personalize the project page.</div>
@@ -486,7 +466,7 @@ export default function ProjectAdmin({ publicKey, onConnect }: AdminProps) {
           </button>
         </div>
         <div className="h-64">
-          <DonationGrowthChartNoSSR data={weeklyGrowth} />
+          <DonationGrowthChartNoSSR projectId={typeof projectId === "string" ? projectId : undefined} />
         </div>
         <p className="text-xs text-[#8aaa8a] dark:text-forest-300 mt-3 font-body">
           Weekly totals based on recent donation history (up to 200 donations loaded).

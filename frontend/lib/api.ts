@@ -296,6 +296,53 @@ export async function fetchProjectDonations(
 }
 
 /**
+ * One page of a donor's history, plus what is needed to fetch the next one.
+ */
+export interface DonorHistoryPage {
+  donations: Donation[];
+  hasMore: boolean;
+  /** Opaque keyset cursor from the API; `null` once the last page is reached. */
+  nextCursor: string | null;
+  /** Donations in total, so the UI can report progress through the history. */
+  total: number;
+}
+
+/**
+ * Fetch one page of a donor's donation history.
+ *
+ * High-volume donors have hundreds of rows, which is far too many to send at
+ * once, so the endpoint is keyset-paginated (issue #1080).
+ *
+ * @param publicKey - Donor Stellar public key.
+ * @param options - Page size and the cursor returned by the previous page.
+ * @returns The page, whether more remain, the next cursor and the total count.
+ * @throws If the request fails.
+ */
+export async function fetchDonorHistoryPage(
+  publicKey: string,
+  { limit = 20, cursor }: { limit?: number; cursor?: string } = {},
+): Promise<DonorHistoryPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+
+  const { data } = await api.get<{
+    success: boolean;
+    data: Donation[];
+    has_more: boolean;
+    next_cursor: string | null;
+    total: number;
+  }>(`/api/donations/donor/${publicKey}`, { params });
+
+  return {
+    donations: data.data ?? [],
+    hasMore: Boolean(data.has_more),
+    nextCursor: data.next_cursor ?? null,
+    // Falls back to the page length so an older API still renders a sane count.
+    total: Number.isFinite(data.total) ? data.total : (data.data?.length ?? 0),
+  };
+}
+
+/**
  * Fetch all donations made by a donor.
  *
  * @param publicKey - Donor Stellar public key.
@@ -484,6 +531,28 @@ export async function fetchSubscriberCount(projectId: string) {
   return data.count;
 }
 
+export interface ProjectNotificationSubscription {
+  id: string;
+  projectId: string;
+  projectName: string;
+  email: string;
+  subscribed: boolean;
+}
+
+export async function fetchNotificationSubscriptions(email: string) {
+  const { data } = await api.get<{ success: boolean; data: ProjectNotificationSubscription[] }>(
+    "/api/subscriptions", { params: { email } },
+  );
+  return data.data;
+}
+
+export async function updateNotificationSubscription(id: string, email: string, subscribed: boolean) {
+  const { data } = await api.patch<{ success: boolean; data: ProjectNotificationSubscription }>(
+    `/api/subscriptions/${id}`, { email, subscribed },
+  );
+  return data.data;
+}
+
 // ── Global Stats ─────────────────────────────────────────────────
 export interface GlobalStats {
   totalXLMRaised: string;
@@ -519,6 +588,52 @@ export async function fetchGlobalStats(): Promise<GlobalStats> {
   }
 
   return normalizeGlobalStats(data);
+}
+
+/** A single point in the donation growth series. */
+export interface DonationGrowthPoint {
+  week: string;
+  totalXLM: number;
+}
+
+/**
+ * Fetch the weekly donation growth series from the backend.
+ *
+ * @param projectId - Optional project UUID; when omitted the series is global.
+ * @returns Weekly totals ordered oldest → newest.
+ * @throws If the request fails.
+ */
+export async function fetchDonationGrowth(
+  projectId?: string,
+): Promise<DonationGrowthPoint[]> {
+  const { data } = await api.get<{ success: boolean; data: DonationGrowthPoint[] }>(
+    "/api/stats/growth",
+    { params: projectId ? { projectId } : undefined },
+  );
+  return data.data;
+}
+
+/**
+ * Download a server-rendered impact certificate as a PDF.
+ *
+ * Used as the reliable fallback for browsers whose client-side canvas
+ * rendering is inconsistent (notably Safari).
+ *
+ * @returns The PDF file as a Blob.
+ * @throws If the request fails.
+ */
+export async function downloadImpactCertificate(payload: {
+  donorAddress: string;
+  donorName?: string | null;
+  totalDonatedXLM: string;
+  totalCO2OffsetKg: number;
+  badgeTier: string | null;
+  projectsSupported: Array<{ id: string; name: string }>;
+}): Promise<Blob> {
+  const { data } = await api.post("/api/impact/certificate/pdf", payload, {
+    responseType: "blob",
+  });
+  return data as Blob;
 }
 
 // ── Admin: Project Approval ──────────────────────────────────────
@@ -780,6 +895,7 @@ export interface VerificationRequestPayload {
 
 export interface VerificationRequestResponse {
   id: string;
+  documentCount: number;
   organizationName: string;
   organizationWebsite: string | null;
   organizationCountry: string | null;
@@ -871,6 +987,26 @@ export async function fetchVerificationRequestAdmin(
 }
 
 /**
+ * Fetch the supporting document metadata for a verification request on demand
+ * (admin). The admin detail page calls this lazily on scroll / expand so the
+ * initial request payload stays lightweight.
+ *
+ * @param id - Verification request id.
+ * @param adminToken - Bearer JWT issued by /api/admin/login.
+ * @returns The supporting document list for the request.
+ */
+export async function fetchVerificationRequestDocuments(
+  id: string,
+  adminToken: string,
+): Promise<VerificationDocument[]> {
+  const { data } = await api.get<{ success: boolean; data: { documents: VerificationDocument[] } }>(
+    `/api/verification-requests/${id}/documents`,
+    { headers: { Authorization: `Bearer ${adminToken}` } },
+  );
+  return data.data.documents;
+}
+
+/**
  * Transition a verification request to a new status (admin-only).
  *
  * @param id - Verification request id.
@@ -890,6 +1026,28 @@ export async function updateVerificationRequestStatus(
     `/api/verification-requests/${id}/status`,
     { status, ...(reviewerNotes !== undefined ? { reviewerNotes } : {}) },
     { headers: { Authorization: `Bearer ${adminToken}` } },
+  );
+  return data.data;
+}
+
+// ── Referrals ─────────────────────────────────────────────────────────────────
+export interface ReferralStats {
+  referralCount: number;
+  referralBonusXLM: string;
+  referredBy: string | null;
+}
+
+export async function fetchReferralStats(publicKey: string): Promise<ReferralStats> {
+  const { data } = await api.get<{ success: boolean; data: ReferralStats }>(
+    `/api/referrals/${publicKey}`,
+  );
+  return data.data;
+}
+
+export async function createReferral(referrerAddress: string, referredAddress: string) {
+  const { data } = await api.post<{ success: boolean; data: any }>(
+    "/api/referrals",
+    { referrerAddress, referredAddress },
   );
   return data.data;
 }
@@ -939,7 +1097,7 @@ export async function fetchTagSuggestions(query: string): Promise<string[]> {
 
 export async function notifyAdmin(payload: AdminNotificationPayload): Promise<{ success: boolean }> {
   const { data } = await api.post<{ success: boolean }>(
-    "/api/admin/notify",
+    "/api/admin/notifications",
     payload,
   );
   return data;
