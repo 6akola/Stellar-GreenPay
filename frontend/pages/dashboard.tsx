@@ -206,6 +206,94 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
     );
   };
 
+  // Key includes the address (certificates are per donor) and the badge tier:
+  // a tier change produces a new key, invalidating the cached snapshot.
+  const certificateCacheKey = `${publicKey}|${topBadgeTier ?? "none"}`;
+
+  const handleDownloadCertificate = async () => {
+    // Criterion 1: only one render can be in flight — later clicks are
+    // ignored while the button is disabled anyway.
+    if (certificateRendering) return;
+    const el = document.getElementById("impact-certificate");
+    if (!el) return;
+
+    // Criterion 2 + 3: serve the cached data URL until the tier changes.
+    const cached = certificateCanvasUrlRef.current;
+    if (cached && cached.key === certificateCacheKey) {
+      triggerCertificateDownload(cached.dataUrl);
+      return;
+    }
+
+    setCertificateRendering(true);
+    try {
+      const canvas = await html2canvas(el, {
+        backgroundColor: "#ffffff",
+        scale: 2,
+        useCORS: true,
+      });
+      const dataUrl = canvas.toDataURL("image/png");
+      certificateCanvasUrlRef.current = { key: certificateCacheKey, dataUrl };
+      triggerCertificateDownload(dataUrl);
+    } catch (err) {
+      // Graceful degradation: the pre-existing print-window flow still gives
+      // the user a downloadable certificate if rasterization fails.
+      console.error("Failed to rasterize the impact certificate", err);
+      handlePrintCertificate();
+    } finally {
+      setCertificateRendering(false);
+    }
+  };
+
+  const handleCreateTeam = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTeamName.trim()) return;
+    setTeamActionState("saving");
+    setTeamError(null);
+    try {
+      const team = await createTeam({ name: newTeamName.trim() });
+      setMyTeam(team);
+      setTeamForm("none");
+      setNewTeamName("");
+      setTeamActionState("success");
+      window.setTimeout(() => setTeamActionState("idle"), 2000);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTeamError(msg || "Could not create team.");
+      setTeamActionState("error");
+    }
+  };
+
+  const handleJoinTeam = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!joinTeamId.trim() || !joinInviteCode.trim()) return;
+    setTeamActionState("saving");
+    setTeamError(null);
+    try {
+      const team = await joinTeam(joinTeamId.trim(), joinInviteCode.trim());
+      setMyTeam(team);
+      setTeamForm("none");
+      setJoinTeamId("");
+      setJoinInviteCode("");
+      setTeamActionState("success");
+      window.setTimeout(() => setTeamActionState("idle"), 2000);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTeamError(msg || "Could not join team.");
+      setTeamActionState("error");
+    }
+  };
+
+  const handleExportCsv = async () => {
+    setExportState("loading");
+    try {
+      await exportDonationHistoryCsv();
+      setExportState("idle");
+    } catch (err: unknown) {
+      setExportState("error");
+      window.setTimeout(() => setExportState("idle"), 3000);
+    }
+  };
+
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-10 animate-fade-in">
 
